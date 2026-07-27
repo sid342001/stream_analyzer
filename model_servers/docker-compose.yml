@@ -1,0 +1,76 @@
+# Model hosting for the UAV Stream Analysis System.
+#   docker compose up -d vlm                    # llama.cpp VLM server (OpenAI API :8080)
+#   docker compose --profile debug up -d perception-api   # optional SAM3/DINOv3 debug API
+#   docker compose --profile vllm  up -d vllm             # optional vLLM alternative
+#
+# Active model/config comes from the profile you copy to .env (see profiles/).
+name: uav-model-servers
+
+services:
+  # ---- VLM: llama.cpp server, GGUF + mmproj, OpenAI-compatible --------------
+  vlm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models:ro
+    command: >
+      -m ${VLM_MODEL}
+      --mmproj ${VLM_MMPROJ}
+      --host 0.0.0.0 --port 8080
+      -ngl ${VLM_NGL} -c ${VLM_CTX} --parallel ${VLM_PARALLEL}
+      --flash-attn --alias uav-vlm
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- Optional: SAM3 + DINOv3 debug API (NOT the live path; see README §1.2) --
+  perception-api:
+    profiles: ["debug"]
+    build: ./perception
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---- Optional: vLLM alternative VLM engine (HF-format, not GGUF) ------------
+  vllm:
+    profiles: ["vllm"]
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models:ro
+    command: >
+      --model ${VLLM_MODEL}
+      --port 8080 --served-model-name uav-vlm
+      --gpu-memory-utilization 0.85 --max-model-len ${VLM_CTX}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,9 @@
+# model weights + HF cache — never committed.
+# NOTE: ignore contents (models/*), not the directory itself, so the
+# models/.gitkeep negation below actually works (git can't re-include a
+# file whose parent directory is excluded).
+models/*
+!models/.gitkeep
+
+# active profile copy
+.env

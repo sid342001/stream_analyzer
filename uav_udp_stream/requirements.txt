@@ -1,0 +1,6 @@
+# The toolkit itself is pure standard library - nothing here is required to run it.
+# Uncomment what you want for analysis work on top of the streams.
+
+# pytest>=8.0        # running the tests
+# folium>=0.16       # plot the decoded lat/lon track on a map
+# matplotlib>=3.8    # telemetry plots from the JSONL output

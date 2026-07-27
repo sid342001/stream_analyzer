@@ -1,0 +1,11 @@
+{
+  "stream_file": "streams/uav_video.ts",
+  "default_port": 5600,
+  "fallback_bitrate": 2000000,
+  "multicast_ttl": 8,
+  "multicast_iface": null,
+  "targets": [
+    { "name": "real-nic", "host": "192.168.1.127", "port": 5600 },
+    { "name": "pseudo-loopback", "host": "127.0.0.1", "port": 5601 }
+  ]
+}

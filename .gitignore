@@ -1,0 +1,69 @@
+# ============================================================
+# stream_analyzer monorepo — root .gitignore
+# Subfolders (frontend/, model_servers/, uav_udp_stream/) carry
+# their own .gitignore for stack-specific rules; this file covers
+# cross-cutting OS/editor/tooling noise and top-level data/artifact
+# directories shared across the project.
+# ============================================================
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- editors / IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / frontend ----
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+*.tsbuildinfo
+
+# ---- Docker ----
+*.pid
+
+# ---- env / secrets ----
+.env
+.env.*
+!.env.example
+!*/profiles/*.env
+
+# ---- model weights, datasets, generated media (large / gitignored everywhere) ----
+# NOTE: "models/" itself is intentionally NOT ignored here — model_servers/.gitignore
+# ignores its own models/ while keeping models/.gitkeep, and a blanket root-level
+# rule would shadow that per-directory exception (git can't re-include a file whose
+# parent directory is already excluded).
+data/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.onnx
+*.pmtiles
+
+# UAV clips, captures, generated streams/telemetry
+streams/*.ts
+streams/*.jsonl
+*.mp4
+*.mkv
+
+# ---- logs ----
+*.log
+logs/
