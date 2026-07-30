@@ -1,31 +1,105 @@
 #!/usr/bin/env bash
 # Download all model weights into ./models (run once, online).
-# Edit the repo IDs / filenames to match the exact models you want — the values
-# here are the PATTERN. Confirm names on Hugging Face before running.
+# Intended for later air-gapped deployment.
+#
+# Uses `hf download` (huggingface_hub v1.0+) — the old `huggingface-cli
+# download` command and its --resume-download / --local-dir-use-symlinks
+# flags are gone as of v1.0. Resume is on by default now, and `--local-dir`
+# writes real files (not symlinks) by default too, so neither flag is needed.
+
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-export HF_HOME="$PWD/models/.hf"        # keep the cache local for air-gapping
+
+# Keep Hugging Face cache inside the project
+export HF_HOME="$PWD/models/.hf"
+
 mkdir -p models
 
-dl() { echo ">> $*"; huggingface-cli download "$@"; }
+dl() {
+    echo ">> $*"
+    hf download "$@"
+}
 
-# ---- Large VLM: your ~27B Q4 GGUF + mmproj (EDIT to match yours) --------------
-: "${VLM_REPO:=<ORG>/<YOUR-27B-VLM-GGUF>}"
-: "${VLM_FILE:=model.Q4_K_M.gguf}"
-: "${VLM_MMPROJ_FILE:=mmproj-model-f16.gguf}"
-dl "$VLM_REPO" "$VLM_FILE" "$VLM_MMPROJ_FILE" --local-dir models/vlm-27b
+###############################################################################
+# Qwen3-VL-8B-FP8 (vLLM) — primary VLM for the `local` (32GB) profile
+###############################################################################
+# 8B, not 30B-A3B: the 30B-A3B model doesn't fit a 32GB card alongside
+# SAM3+DINOv3 at any quantization down to official FP8 (~31GB alone, zero
+# headroom). 8B-FP8 is ~9-10GB — comfortable room for perception + KV cache.
 
-# ---- Qwen3-VL (GGUF for llama.cpp; pick a size that fits) ---------------------
-: "${QWEN_REPO:=<ORG>/Qwen3-VL-8B-GGUF}"
-dl "$QWEN_REPO" "Qwen3-VL-8B.Q4_K_M.gguf" "mmproj-Qwen3-VL-8B-f16.gguf" \
-   --local-dir models/qwen3vl
+: "${QWEN_REPO:=Qwen/Qwen3-VL-8B-Instruct-FP8}"
 
-# ---- SAM 3 (PyTorch, in-process perception) — confirm repo -------------------
-dl "facebook/sam3" --local-dir models/sam3 || \
-  echo "!! SAM 3 unavailable — use SAM 2.1 + GroundingDINO fallback (see perception/README.md)"
+dl \
+    "$QWEN_REPO" \
+    --local-dir models/qwen3-vl-8b-instruct-fp8
 
-# ---- DINOv3 (PyTorch, in-process) — confirm repo -----------------------------
-dl "facebook/dinov3-vitl16-pretrain" --local-dir models/dinov3
+###############################################################################
+# Qwen3-VL-30B-A3B-Instruct (BF16) — VLM for the `full` (H100 80GB) profile
+###############################################################################
+# Only needed once you're actually deploying on the H100 — 58GB, no reason to
+# pull it onto the 32GB local box otherwise. Full precision fits comfortably
+# in 80GB alongside SAM3+DINOv3, no re-quantization needed.
 
-echo "done. weights in ./models (gitignored)."
+: "${QWEN_FULL_REPO:=Qwen/Qwen3-VL-30B-A3B-Instruct}"
+
+dl \
+    "$QWEN_FULL_REPO" \
+    --local-dir models/qwen3-vl-30b-a3b-instruct
+
+###############################################################################
+# Gemma 4 12B GGUF (llama.cpp standby)
+###############################################################################
+
+: "${GEMMA_REPO:=unsloth/gemma-4-12B-it-GGUF}"
+: "${GEMMA_FILE:=gemma-4-12b-it-UD-Q5_K_XL.gguf}"
+: "${GEMMA_MMPROJ_FILE:=mmproj-F16.gguf}"
+
+# Confirm both filenames on the repo before running — Unsloth's "UD" dynamic
+# quants and mmproj tags change as new ones are cut.
+dl \
+    "$GEMMA_REPO" \
+    "$GEMMA_FILE" \
+    "$GEMMA_MMPROJ_FILE" \
+    --local-dir models/gemma4-12b
+
+###############################################################################
+# SAM 3 — gated, request access on the HF repo first, then `hf auth login`
+###############################################################################
+
+: "${SAM_REPO:=facebook/sam3}"
+
+dl \
+    "$SAM_REPO" \
+    --local-dir models/sam3 \
+|| echo "!! SAM 3 unavailable (access not granted?) — fall back to SAM 2.1 + GroundingDINO, see perception/README.md"
+
+###############################################################################
+# DINOv3 ViT-L (general purpose embeddings)
+###############################################################################
+
+: "${DINO_REPO:=facebook/dinov3-vitl16-pretrain-lvd1689m}"
+
+dl \
+    "$DINO_REPO" \
+    --local-dir models/dinov3-vitl16
+
+###############################################################################
+
+echo
+echo "=============================================="
+echo "Model download complete."
+echo
+echo "Directory layout:"
+echo
+echo "models/"
+echo "├── .hf/"
+echo "├── qwen3-vl-8b-instruct-fp8/   # local (32GB) profile — primary"
+echo "├── qwen3-vl-30b-a3b-instruct/  # full (H100) profile only"
+echo "├── gemma4-12b/                 # GGUF + mmproj together"
+echo "├── sam3/"
+echo "└── dinov3-vitl16/"
+echo
+echo "SAM 3 inference library (if needed):"
+echo "pip install git+https://github.com/facebookresearch/sam3.git"
+echo "=============================================="

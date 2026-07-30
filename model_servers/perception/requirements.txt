@@ -1,0 +1,24 @@
+# CUDA-matched torch build — align the index URL with the CUDA version baked
+# into the Dockerfile's base image if you change it.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
+torchvision==0.20.1
+
+transformers>=4.56.0        # first release with native DINOv3 support
+accelerate>=0.34.0
+pillow>=10.4.0
+numpy>=1.26.4
+opencv-python-headless>=4.10.0.84
+pycocotools>=2.0.8          # mask RLE encode/decode
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9     # FastAPI UploadFile/Form parsing
+
+einops>=0.8.0             # sam3 imports this but doesn't declare it as a dependency
+
+# SAM 3 — not on PyPI; repo is pip-installable directly. Checkpoint is gated
+# on Hugging Face (facebookresearch/sam3) — `huggingface-cli login` with
+# access accepted, done on the HOST during the download step in
+# scripts/download_models.sh, before weights are mounted read-only here.
+git+https://github.com/facebookresearch/sam3.git

@@ -1,13 +1,13 @@
 # Model hosting for the UAV Stream Analysis System.
-#   docker compose up -d vlm                    # llama.cpp VLM server (OpenAI API :8080)
-#   docker compose --profile debug up -d perception-api   # optional SAM3/DINOv3 debug API
-#   docker compose --profile vllm  up -d vllm             # optional vLLM alternative
+#   docker compose --profile vllm up -d vllm     # Qwen3-VL via vLLM (OpenAI API :8080) — primary
+#   docker compose --profile debug up -d perception-api  # SAM 3 + DINOv3 (:8090)
+#   docker compose up -d vlm                     # optional: Gemma 4 12B standby via llama.cpp
 #
 # Active model/config comes from the profile you copy to .env (see profiles/).
 name: uav-model-servers
 
 services:
-  # ---- VLM: llama.cpp server, GGUF + mmproj, OpenAI-compatible --------------
+  # ---- Optional standby VLM: llama.cpp server, GGUF + mmproj (Gemma 4 12B) --
   vlm:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     restart: unless-stopped
@@ -35,7 +35,8 @@ services:
               count: all
               capabilities: [gpu]
 
-  # ---- Optional: SAM3 + DINOv3 debug API (NOT the live path; see README §1.2) --
+  # ---- SAM 3 + DINOv3 API (stand-in until backend/ imports them in-process;
+  # see README §1.3 — that in-process design is still the eventual target) ----
   perception-api:
     profiles: ["debug"]
     build: ./perception
@@ -45,6 +46,7 @@ services:
       - "8090:8090"
     volumes:
       - ./models:/models:ro
+      - ./perception/concepts:/app/concepts   # concept packs — read/written by tools/*.py, persists on host
     deploy:
       resources:
         reservations:
@@ -53,12 +55,19 @@ services:
               count: all
               capabilities: [gpu]
 
-  # ---- Optional: vLLM alternative VLM engine (HF-format, not GGUF) ------------
+  # ---- Primary VLM: Qwen3-VL via vLLM (HF-format, not GGUF) -------------------
   vllm:
     profiles: ["vllm"]
     image: vllm/vllm-openai:latest
     restart: unless-stopped
     env_file: .env
+    environment:
+      # WSL2 Docker Desktop: vLLM's V1 engine hard-requires pinned/UVA memory
+      # and crashes ("UVA is not available") without this — pinned memory is
+      # supported on WSL2 kernels >=4.19.121 but off by default. See
+      # vllm/platforms/cuda.py CudaPlatform.is_pin_memory_available().
+      VLLM_WSL2_ENABLE_PIN_MEMORY: "1"
+    ipc: host   # vLLM's own recommended Docker setting — shared memory for tensor IPC
     ports:
       - "8080:8080"
     volumes:

@@ -12,6 +12,9 @@ export interface FeedHandlers {
   onTracks: (tracks: TrackedObject[]) => void;
   onTelemetry: (t: Telemetry) => void;
   onEvent: (e: EventItem) => void;
+  /** JPEG data URL for one decoded video frame. Optional: MockFeed has no
+   * real video to simulate, only WsFeed calls this. */
+  onFrame?: (dataUrl: string) => void;
 }
 
 export interface Feed {

@@ -7,20 +7,28 @@ import { EventFeed } from "@/components/EventFeed";
 import { TimelineStrip } from "@/components/TimelineStrip";
 import { DetailView } from "@/components/DetailView";
 import { useStore } from "@/store/useStore";
-import { MockFeed } from "@/lib/feed";
+import type { Feed } from "@/lib/feed";
+import { WsFeed } from "@/lib/wsFeed";
 
 export default function App() {
+  const setFrame = useStore((s) => s.setFrame);
   const setTracks = useStore((s) => s.setTracks);
   const setTelemetry = useStore((s) => s.setTelemetry);
   const addEvent = useStore((s) => s.addEvent);
   const tickNow = useStore((s) => s.tickNow);
-  const feedRef = useRef<MockFeed | null>(null);
+  const loadConcepts = useStore((s) => s.loadConcepts);
+  const feedRef = useRef<Feed | null>(null);
 
-  // start the (simulated) live feed — swap MockFeed for a WsFeed to go live
   useEffect(() => {
-    const feed = new MockFeed();
+    loadConcepts();
+  }, [loadConcepts]);
+
+  // live feed, backed by backend/app/main.py's /ws — see lib/wsFeed.ts
+  useEffect(() => {
+    const feed = new WsFeed();
     feedRef.current = feed;
     feed.start({
+      onFrame: (f) => useStore.getState().playing && setFrame(f),
       onTracks: (t) => useStore.getState().playing && setTracks(t),
       onTelemetry: setTelemetry,
       onEvent: addEvent,
@@ -30,7 +38,7 @@ export default function App() {
       feed.stop();
       clearInterval(clock);
     };
-  }, [setTracks, setTelemetry, addEvent, tickNow]);
+  }, [setFrame, setTracks, setTelemetry, addEvent, tickNow]);
 
   // keep the feed's enabled-concept set in sync with the watch-list
   const concepts = useStore((s) => s.concepts);

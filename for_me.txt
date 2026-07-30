@@ -1,0 +1,11 @@
+Launch the UDP Stream
+
+python make_video_stream.py --source "test_video\Day Flight.mpg" --out "streams\day_flight_with_klv.ts"
+
+
+python stream_udp.py --file "streams\day_flight_with_klv.ts" # for looping add --loop
+
+for watching the stream and recienving 
+
+python recieve_stream.py
+

@@ -1,2 +1,0 @@
-# Weights land here (gitignored). Populate with scripts/download_models.sh.
-# Expected subdirs: vlm-27b/  qwen3vl/  sam3/  dinov3/  .hf/

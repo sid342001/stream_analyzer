@@ -13,31 +13,55 @@ Two very different kinds of model, served two different ways — on purpose.
 
 | Model | Kind | Served via | Path | Why |
 |---|---|---|---|---|
-| Large VLM — your **~27B Q4 GGUF + mmproj** | multimodal LLM | **llama.cpp** `llama-server` (container) | slow/reasoning path, Tier 2–3 | GGUF+mmproj is llama.cpp-native; OpenAI-compatible; hot-swappable |
-| **Qwen3-VL** (GGUF) | multimodal LLM | **llama.cpp** `llama-server` (container) | alt/second VLM | same server, same API — just another `-m` |
-| **SAM 3** | vision transformer (PyTorch) | **in-memory, in the backend process** | perception, **Tier 1, every sampled frame** | real-time hot path; no HTTP overhead |
-| **DINOv3** | vision transformer (PyTorch) | **in-memory, same process as SAM 3** | verifier, embeds SAM 3 crops | tight pipeline with SAM 3; share the frame tensor |
+| **Qwen3-VL-30B-A3B** | multimodal LLM | **vLLM** `vllm/vllm-openai` (container) | primary reasoning path, Tier 2–3 | HF-format MoE; OpenAI-compatible; see the Gemma 4 comparison below for why this stays primary |
+| **Gemma 4 12B** (encoder-free, GGUF+mmproj) | multimodal LLM | **llama.cpp** `llama-server` (container), optional | standby/alt VLM, hot-swap only | brought up later if/when needed — see §1.3 |
+| **SAM 3** | vision transformer (PyTorch) | container today (`perception-api`, :8090); in-process once `backend/` exists | perception, **Tier 1, every sampled frame** | real-time hot path; no HTTP overhead once in-process |
+| **DINOv3** | vision transformer (PyTorch) | same container as SAM 3 | verifier, embeds SAM 3 crops | tight pipeline with SAM 3; share the frame tensor |
 
-### 1.1 Why llama.cpp for the VLMs (not vLLM)
+> **Current state vs. eventual state:** `backend/` (the FastAPI orchestrator) doesn't
+> exist yet. Until it does, SAM 3 + DINOv3 are hosted as their own `perception-api`
+> container so they're actually runnable today. Once `backend/` is built, it should
+> import `perception/` in-process and this container becomes debug-only again — see
+> §1.3.
 
-- **Format match.** You want **Q4 GGUF + mmproj**. That is llama.cpp's native
-  format. vLLM consumes HF-format weights with AWQ/GPTQ/FP8 — it does **not** load
-  mmproj GGUF. Choosing llama.cpp means your stated artifacts run as-is.
-- **VRAM efficiency + CPU offload.** llama.cpp fits large models on a 32 GB card
-  and can spill layers to CPU RAM (you have 256 GB) via `-ngl`, so a 27B Q4 runs
-  even when VRAM is tight. vLLM keeps everything resident on the GPU.
-- **Single-box, few-user, real-time.** One operator (or a few). llama.cpp's
-  single-stream latency is excellent and the server is one lightweight container.
-- **Hot-swap.** Swapping the 27B for Qwen3-VL is changing one `-m` flag / profile,
-  not re-provisioning a serving engine.
-- **OpenAI-compatible + vision.** `llama-server` exposes `/v1/chat/completions`
-  with image inputs, so the orchestrator calls it exactly like any OpenAI tool.
+### 1.1 Qwen3-VL via vLLM (primary)
 
-> **When vLLM would win:** many concurrent sessions with heavy batched throughput,
-> or FP8 tensor-parallel across datacenter GPUs. Not this deployment. A vLLM
-> alternative is stubbed in `vllm/` if you ever need it — see §7.
+Qwen3-VL-30B-A3B is hosted HF-format through vLLM rather than GGUF through
+llama.cpp. vLLM keeps the full MoE resident on GPU (no CPU-offload path, unlike
+llama.cpp's `-ngl`), which is fine at Q-equivalent FP8/AWQ sizes on a 32 GB card,
+and `vllm/vllm-openai` exposes the same OpenAI-compatible `/v1/chat/completions`
+with image inputs, so the orchestrator's call shape doesn't change. `llama.cpp`
+is kept in the stack (the `vlm` service) specifically as the engine for the
+Gemma 4 12B standby below — GGUF+mmproj is llama.cpp-native, not vLLM's format.
 
-### 1.2 Why SAM 3 + DINOv3 stay in-memory (not an API)
+### 1.2 Gemma 4 12B — optional standby, hosted later
+
+An encoder-free multimodal model (Google, Apache 2.0) considered as an
+alternative to Qwen3-VL. Decision: **keep Qwen3-VL primary**, host Gemma 4 12B
+as an optional hot-swappable standby via the `vlm` (llama.cpp) service once you
+download it — reasons:
+
+- **Task fit.** Qwen3-VL is explicitly trained/benchmarked on grounding tasks
+  (RefCOCO/+/g, ODinW-13, CountBench) — the closer match to "describe/answer
+  about what SAM 3 already located," which is all the VLM does in this
+  pipeline (Tier 2 one-liners off SAM 3 crops, Tier 3 grounded Q&A). Gemma 4's
+  benchmark edge is in domains (STEM reasoning, native audio) this pipeline
+  doesn't touch.
+- **Maturity.** Gemma 4 12B's encoder-free design is a brand-new code path in
+  llama.cpp (added ~June 2026) and already had a real crash bug from the exact
+  mechanism that makes it novel (zero attention-head-dim math with no vision
+  encoder — `ggml-org/llama.cpp` issue #24085, fixed in PR #24088). Qwen3-VL's
+  encoder+mmproj path is the long-established pattern the GGUF vision ecosystem
+  is built around.
+- **Why keep it at all:** smaller footprint than the 30B-class primary, one
+  unified text/image/audio architecture, and audio becomes relevant if
+  acoustic UAV sensors are ever added. Worth having as a fast, light fallback
+  or a second opinion — not as the default.
+
+Bring it up only once hosted: `docker compose up -d vlm` (don't run it and
+`vllm` together — they share port 8080).
+
+### 1.3 Why SAM 3 + DINOv3 stay in-memory (not an API) — the eventual design
 
 - They are **not** LLMs — llama.cpp/vLLM don't serve them; they run under PyTorch.
 - SAM 3 runs on **every sampled frame** (Tier 1). DINOv3 embeds the **crops SAM 3
@@ -59,19 +83,19 @@ process. The perception package + weights are hosted here; the backend imports t
 
 ## 2. VRAM budget on the 32 GB card
 
-llama.cpp VLM + in-memory perception share one GPU. Realistic footprints:
+Qwen3-VL (vLLM) + SAM 3 + DINOv3 share one GPU today, as three separate
+containers. Realistic footprints:
 
 | Resident set | Approx. VRAM | Fits 32 GB? |
 |---|---|---|
-| 27B Q4_K_M VLM (+mmproj ~1 GB) + SAM 3 + DINOv3 (ViT-L) | ~22–26 GB | ✅ comfortable |
-| …plus a second VLM (Qwen3-VL-8B Q4, ~6 GB) resident | ~28–33 GB | ⚠️ too tight — hot-swap instead |
+| Qwen3-VL-30B-A3B (vLLM, FP8/AWQ) + SAM 3 + DINOv3 (ViT-L) | ~22–28 GB | ✅ comfortable |
+| …plus Gemma 4 12B standby also resident | ~35–42 GB | ❌ too tight — hot-swap instead, don't run both |
 | 30B-class VLM FP8 + SAM 3 + DINOv3 (`full` profile) | ~40 GB | ❌ needs the H100 (`full` profile) |
 
-**Guidance:** run **one large VLM at a time** as the reasoning brain, with SAM 3 +
-DINOv3 always resident for Tier 1. If you want both the 27B and Qwen3-VL available,
-**hot-swap** them in `llama-server` (load on request / restart the `vlm` service
-with the other profile) rather than keeping both resident. Use `-ngl` to offload
-VLM layers to CPU RAM if you need extra headroom.
+**Guidance:** run **one VLM at a time** as the reasoning brain, with SAM 3 +
+DINOv3 always resident for Tier 1. Bring Gemma 4 12B up only when you actually
+want it: stop `vllm`, start `vlm` (llama.cpp) — don't run both at once, they
+share port 8080 and the combined footprint doesn't fit.
 
 Profiles capture this: `profiles/local.env` (this box) and `profiles/full.env`
 (H100). Compose reads one via `env_file`.
@@ -99,66 +123,52 @@ huggingface-cli login
 All weights land in `./models/` (gitignored) and are mounted **read-only** into
 the containers. Run `scripts/download_models.sh` or the commands below.
 
-> ⚠️ **Confirm exact repo IDs and quant tags on Hugging Face before downloading.**
-> Model naming moves fast; the IDs below are the *pattern*, not gospel. In
-> particular, verify the precise name of your "~27B Q4 mmproj" VLM — set it in
-> `profiles/local.env`.
+> ⚠️ **Confirm exact quant tags on Hugging Face before downloading** — the repo
+> IDs below are confirmed real as of this writing, but specific quant files move.
 
 ```bash
 export HF_HOME=$PWD/models/.hf          # keep the HF cache local for air-gapping
 cd model_servers
 
-# --- Large VLM: your ~27B Q4 GGUF + mmproj (edit repo/files to match yours) -------
-huggingface-cli download <ORG>/<YOUR-27B-VLM-GGUF> \
-    <model>.Q4_K_M.gguf  mmproj-<model>-f16.gguf \
-    --local-dir models/vlm-27b
+# --- Primary VLM: Qwen3-VL, HF format for vLLM (not GGUF) -------------------------
+huggingface-cli download Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --local-dir models/qwen3-vl-30b-a3b-instruct
 
-# --- Qwen3-VL (GGUF for llama.cpp; pick a size that fits, e.g. 8B) ----------------
-huggingface-cli download <ORG>/Qwen3-VL-8B-GGUF \
-    Qwen3-VL-8B.Q4_K_M.gguf  mmproj-Qwen3-VL-8B-f16.gguf \
-    --local-dir models/qwen3vl
+# --- SAM 3 (PyTorch weights) — gated, request access on the HF repo first --------
+huggingface-cli login   # after your access request is accepted
+huggingface-cli download facebook/sam3 --local-dir models/sam3
 
-# --- SAM 3 (PyTorch weights, loaded in-process by perception) --------------------
-huggingface-cli download facebook/sam3 --local-dir models/sam3            # confirm repo
+# --- DINOv3 (PyTorch) -------------------------------------------------------------
+huggingface-cli download facebook/dinov3-vitl16-pretrain-lvd1689m --local-dir models/dinov3
 
-# --- DINOv3 (PyTorch, in-process) ------------------------------------------------
-huggingface-cli download facebook/dinov3-vitl16-pretrain --local-dir models/dinov3   # confirm repo
+# --- Optional, only when you're ready to host the standby: Gemma 4 12B GGUF ------
+huggingface-cli download unsloth/gemma-4-12B-it-GGUF \
+    gemma-4-12b-it-Q4_K_M.gguf  mmproj-gemma-4-12b-it-f16.gguf \
+    --local-dir models/gemma4-12b
 ```
 
-Fallback if SAM 3 weights aren't available to you: download **SAM 2.1** +
+Fallback if SAM 3 access isn't granted yet: download **SAM 2.1** +
 **GroundingDINO** instead and set `PERCEPTION_BACKEND=sam2_gdino` (see
 `perception/README.md`).
 
 ---
 
-## 5. Host the VLM (llama.cpp)
-
-The VLM server is defined in `docker-compose.yml` and parameterized by the active
-profile. Bring it up:
+## 5. Host the primary VLM — Qwen3-VL via vLLM
 
 ```bash
 cd model_servers
 cp profiles/local.env .env         # or: ln -s profiles/local.env .env
-docker compose up -d vlm
-docker compose logs -f vlm         # watch it load
+docker compose --profile vllm up -d vllm
+docker compose logs -f vllm        # watch it load
 ```
 
-What Compose runs under the hood (GPU, GGUF + mmproj, OpenAI API on :8080):
+What Compose runs under the hood (GPU, HF format, OpenAI API on :8080):
 
 ```bash
-llama-server \
-  -m       /models/vlm-27b/<model>.Q4_K_M.gguf \
-  --mmproj /models/vlm-27b/mmproj-<model>-f16.gguf \
-  --host 0.0.0.0 --port 8080 \
-  -ngl 99 -c 8192 --parallel 2 --flash-attn \
-  --alias uav-vlm
+vllm serve /models/qwen3-vl-30b-a3b-instruct \
+  --port 8080 --served-model-name uav-vlm \
+  --gpu-memory-utilization 0.85 --max-model-len 32768
 ```
-
-- `-ngl 99` = offload all layers to GPU; **lower it** (e.g. `-ngl 60`) to spill to
-  CPU RAM and free VRAM for perception.
-- `-c 8192` = context; images consume context, keep prompts terse (matches the
-  doc's "terse grounded lines").
-- `--parallel 2` = a couple of concurrent slots; raise only if you have headroom.
 
 **Health check + a real vision call:**
 
@@ -175,42 +185,50 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 }'
 ```
 
-**Hot-swap to Qwen3-VL:** point the profile at `models/qwen3vl/…` and
-`docker compose up -d --force-recreate vlm`. Same endpoint, same API.
-
 ---
 
-## 6. Host the perception models (SAM 3 + DINOv3, in-memory)
+## 6. Host the perception models — SAM 3 + DINOv3
 
-These are **not** started as their own live service. The **backend container**
-installs the `perception/` package and loads the weights once at startup:
+There's no `backend/` orchestrator yet to import `perception/` in-process (the
+eventual design, §1.3), so host them as their own container for now:
 
-```python
-# in the backend, at startup (illustrative — see perception/interface.py)
-from perception import Perception
-percept = Perception(profile_env())      # loads SAM 3 + DINOv3 onto the GPU, once
-# per sampled frame, in-process, no HTTP:
-dets = percept.detect_track(frame, concepts, exemplars)
-crops_emb = percept.embed(frame, dets)   # DINOv3 on SAM 3's crops
+```bash
+docker compose --profile debug up -d perception-api   # exposes :8090
+docker compose logs -f perception-api                 # watch weights load
 ```
 
-Point the backend at the weights via env (set in the top-level compose):
+```bash
+curl -s localhost:8090/health
+
+curl -s localhost:8090/detect_track \
+  -F "image=@sample.jpg" \
+  -F 'concepts=[{"label":"person","text_prompt":"person"}]'
+```
+
+Point it at the weights via `.env` (already set by the profile):
 `SAM_WEIGHTS=/models/sam3`, `DINOV3_WEIGHTS=/models/dinov3`,
 `PERCEPTION_BACKEND=sam3|sam2_gdino`.
 
-Optional debug API (never on the live path):
-```bash
-docker compose --profile debug up -d perception-api   # exposes :8090 for poking
-```
+When `backend/` gets built, switch to importing `perception/` directly instead
+(see `perception/interface.py` and §1.3) and retire this container back to
+debug-only use.
 
 ---
 
-## 7. Optional: vLLM alternative
+## 7. Optional: Gemma 4 12B standby via llama.cpp
 
-If you later need high-concurrency serving, `vllm/` holds a Compose service for an
-HF-format Qwen3-VL (AWQ/FP8). It exposes the **same OpenAI API on :8080**, so the
-orchestrator is unchanged. Do not run it *and* llama.cpp on the same port/GPU at
-once — pick one VLM engine. It cannot load your GGUF/mmproj files.
+Bring it up only once you've downloaded it (§4) and actually want it — see §1.2
+for why this stays a standby, not the default:
+
+```bash
+docker compose up -d vlm           # stop `vllm` first — they share port 8080
+docker compose logs -f vlm
+```
+
+Compose runs `llama-server -m <gguf> --mmproj <mmproj> --host 0.0.0.0 --port 8080
+-ngl 99 -c 8192 --parallel 2 --flash-attn --alias uav-vlm` — same OpenAI API
+shape, same `/v1/chat/completions` calls, so nothing downstream needs to change
+when you swap between it and `vllm`.
 
 ---
 
@@ -234,16 +252,20 @@ is fetched at runtime.
 ```
 model_servers/
 ├─ README.md                # this file
-├─ docker-compose.yml       # vlm (llama.cpp) + optional perception-api / vllm
+├─ docker-compose.yml       # vllm (primary) + perception-api + vlm (Gemma 4 standby)
 ├─ .env                     # copy of the active profile (gitignored)
 ├─ profiles/
-│  ├─ local.env             # RTX 5000 Ada 32 GB: 27B Q4 + SAM 3 + DINOv3
-│  └─ full.env              # H100 80 GB: 30B FP8 (the architecture doc)
-├─ llamacpp/                # entrypoint / tuning notes for llama-server
-├─ vllm/                    # optional vLLM alternative (§7)
-├─ perception/              # SAM 3 + DINOv3 in-memory package (imported by backend)
+│  ├─ local.env             # RTX 5000 Ada 32 GB: Qwen3-VL (vLLM) + SAM 3 + DINOv3
+│  └─ full.env              # H100 80 GB (the architecture doc)
+├─ llamacpp/                # entrypoint / tuning notes for the Gemma 4 standby
+├─ vllm/                    # notes for the primary vLLM service
+├─ perception/              # SAM 3 + DINOv3 — Dockerfile + FastAPI service today;
+│  │                        # importable in-process once backend/ exists (§1.3)
 │  ├─ README.md
-│  └─ interface.py          # Perception.detect_track / embed  (the in-process API)
+│  ├─ Dockerfile
+│  ├─ requirements.txt
+│  ├─ interface.py          # Perception.detect_track / embed (the shared API)
+│  └─ service.py            # FastAPI wrapper, :8090
 ├─ scripts/
 │  ├─ download_models.sh
 │  └─ verify_offline.sh

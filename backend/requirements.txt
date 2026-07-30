@@ -1,0 +1,21 @@
+# Perception's own stack (SAM 3 + DINOv3) — kept identical to
+# model_servers/perception/requirements.txt since this image runs the same
+# Perception class in-process. If you change one, change both.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
+torchvision==0.20.1
+transformers>=4.56.0
+accelerate>=0.34.0
+pillow>=10.4.0
+numpy>=1.26.4
+opencv-python-headless>=4.10.0.84
+pycocotools>=2.0.8
+einops>=0.8.0
+git+https://github.com/facebookresearch/sam3.git
+
+# Backend-specific
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+av>=13.0.0          # PyAV — H.264/MPEG-TS video decode, see app/ingest.py

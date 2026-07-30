@@ -8,27 +8,39 @@ import { fmtClock } from "@/lib/utils";
 import type { TrackedObject } from "@/lib/types";
 
 /** Draws the live UAV frame + SAM-3 style overlays onto a canvas. */
-function render(ctx: CanvasRenderingContext2D, w: number, h: number, tracks: TrackedObject[], t: number) {
-  // scene: dark IR-ish gradient + drifting terrain blobs
-  const g = ctx.createLinearGradient(0, 0, 0, h);
-  g.addColorStop(0, "#0a0f16");
-  g.addColorStop(1, "#0d1420");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, w, h);
+function render(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  tracks: TrackedObject[],
+  t: number,
+  frameImg: HTMLImageElement | null,
+) {
+  if (frameImg && frameImg.complete && frameImg.naturalWidth > 0) {
+    // real decoded video frame (backend/app/pipeline.py's "frame" messages)
+    ctx.drawImage(frameImg, 0, 0, w, h);
+  } else {
+    // no stream connected yet — procedural placeholder, not real video
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "#0a0f16");
+    g.addColorStop(1, "#0d1420");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
 
-  ctx.globalAlpha = 0.5;
-  for (let i = 0; i < 6; i++) {
-    const bx = ((i * 137 + t * 6) % (w + 200)) - 100;
-    const by = (i * 97) % h;
-    const rad = ctx.createRadialGradient(bx, by, 0, bx, by, 120);
-    rad.addColorStop(0, "rgba(60,90,120,0.25)");
-    rad.addColorStop(1, "transparent");
-    ctx.fillStyle = rad;
-    ctx.beginPath();
-    ctx.arc(bx, by, 120, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.globalAlpha = 0.5;
+    for (let i = 0; i < 6; i++) {
+      const bx = ((i * 137 + t * 6) % (w + 200)) - 100;
+      const by = (i * 97) % h;
+      const rad = ctx.createRadialGradient(bx, by, 0, bx, by, 120);
+      rad.addColorStop(0, "rgba(60,90,120,0.25)");
+      rad.addColorStop(1, "transparent");
+      ctx.fillStyle = rad;
+      ctx.beginPath();
+      ctx.arc(bx, by, 120, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
-  ctx.globalAlpha = 1;
 
   // faint grid
   ctx.strokeStyle = "rgba(120,150,180,0.06)";
@@ -132,8 +144,10 @@ function corners(ctx: CanvasRenderingContext2D, x: number, y: number, w: number,
 
 export function CenterFeed() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const frameImgRef = useRef<HTMLImageElement>(new Image());
   const tracks = useStore((s) => s.tracks);
   const telemetry = useStore((s) => s.telemetry);
+  const frame = useStore((s) => s.frame);
   const playing = useStore((s) => s.playing);
   const setPlaying = useStore((s) => s.setPlaying);
   const addConcept = useStore((s) => s.addConcept);
@@ -141,6 +155,29 @@ export function CenterFeed() {
 
   const [drawing, setDrawing] = useState(false);
   const [newName, setNewName] = useState("");
+  const [fps, setFps] = useState(0);
+  const frameCountRef = useRef(0);
+
+  // decode incoming JPEG data URLs off the render loop — the <img> just
+  // holds whatever finished decoding most recently, draw() below reads it
+  // fresh every frame regardless of exactly when it finishes loading
+  useEffect(() => {
+    if (frame) {
+      frameImgRef.current.src = frame;
+      frameCountRef.current += 1;
+    }
+  }, [frame]);
+
+  // measured, not assumed — counts actual "frame" messages received per
+  // second, so this reflects real stream/network health (backend/app/config.py's
+  // DISPLAY_FPS is only a target)
+  useEffect(() => {
+    const id = setInterval(() => {
+      setFps(frameCountRef.current);
+      frameCountRef.current = 0;
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -156,15 +193,13 @@ export function CenterFeed() {
         canvas.height = rect.height * dpr;
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      render(ctx, rect.width, rect.height, tracks, t);
+      render(ctx, rect.width, rect.height, tracks, t, frameImgRef.current);
       t += 1;
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
   }, [tracks]);
-
-  const colors = ["#f472b6", "#facc15", "#4ade80", "#22d3ee", "#fb923c"];
 
   return (
     <div className="flex h-full flex-col gap-2">
@@ -188,7 +223,9 @@ export function CenterFeed() {
             <Layers className="h-3 w-3" /> Tier 1 · SAM 3 overlays
           </Badge>
         </div>
-        <div className="font-mono text-xs text-muted-foreground">{fmtClock(now)} · {tracks.length} tracks</div>
+        <div className="font-mono text-xs text-muted-foreground">
+          {fmtClock(now)} · {fps} fps · {tracks.length} tracks
+        </div>
       </div>
 
       <div className="relative flex-1 overflow-hidden rounded-lg border border-border bg-black">
@@ -210,7 +247,8 @@ export function CenterFeed() {
             <div className="w-72 animate-fade-in rounded-lg border border-border bg-panel p-4 shadow-2xl">
               <div className="mb-1 text-sm font-semibold">Teach a new concept</div>
               <p className="mb-3 text-xs text-muted-foreground">
-                Frame paused. Name it and it goes live — no training, just an example.
+                Frame paused. Name it and SAM 3 starts looking for it by text —
+                drawing example boxes for a tighter match isn't wired up yet.
               </p>
               <Input
                 autoFocus
@@ -227,14 +265,7 @@ export function CenterFeed() {
                   size="sm"
                   disabled={!newName.trim()}
                   onClick={() => {
-                    addConcept({
-                      id: `c_${Date.now()}`,
-                      label: newName.trim(),
-                      color: colors[Math.floor(Math.random() * colors.length)],
-                      priority: "watch",
-                      exemplars: 1,
-                      enabled: true,
-                    });
+                    addConcept(newName.trim());
                     setNewName("");
                     setDrawing(false);
                     setPlaying(true);

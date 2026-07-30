@@ -1,0 +1,47 @@
+# Top-level orchestrator: ties the backend to the model servers in
+# model_servers/docker-compose.yml. Bring those up first:
+#
+#   cd model_servers && docker compose --profile vllm up -d vllm
+#   cd model_servers && docker compose --profile debug up -d perception-api  # optional now — see backend/README.md
+#   cd ..            && docker compose up -d backend
+#
+# `backend` joins model_servers' own network so it can reach `vllm` by
+# service name — see the `networks:` block below.
+name: uav-stream-analyzer
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "5600:5600/udp"   # UDP video+KLV ingest — see STREAM_URL below
+    environment:
+      # 0.0.0.0: a bind address for this container to listen on, not a peer
+      # to connect to — see app/config.py's comment on why
+      # host.docker.internal doesn't work here.
+      STREAM_URL: ${STREAM_URL:-udp://0.0.0.0:5600}
+      PERCEPTION_BACKEND: sam3
+      SAM_WEIGHTS: /models/sam3
+      DINOV3_WEIGHTS: /models/dinov3-vitl16
+      SAMPLE_FPS: "6"
+      VLM_BASE_URL: http://vllm:8080/v1
+      VLM_MODEL_NAME: uav-vlm
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ./model_servers/models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  default:
+    name: uav-model-servers_default
+    external: true

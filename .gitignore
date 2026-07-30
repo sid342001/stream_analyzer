@@ -63,6 +63,9 @@ streams/*.ts
 streams/*.jsonl
 *.mp4
 *.mkv
+*.mpg
+*.mpeg
+test_video/
 
 # ---- logs ----
 *.log
