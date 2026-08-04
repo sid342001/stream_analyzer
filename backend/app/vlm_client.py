@@ -14,6 +14,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# One pooled client rather than a fresh connection (and TCP handshake) per
+# call. Shared across the VLM thread pool — httpx.Client is thread-safe.
+_client = httpx.Client(timeout=30.0)
+
 
 def _encode_jpeg_data_url(crop: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
@@ -31,7 +35,7 @@ def describe_crop(base_url: str, model: str, crop: np.ndarray, concept: str, tim
     image_url = _encode_jpeg_data_url(crop)
     prompt = f"One short grounded sentence: what is this {concept} doing?"
     try:
-        resp = httpx.post(
+        resp = _client.post(
             f"{base_url}/chat/completions",
             json={
                 "model": model,

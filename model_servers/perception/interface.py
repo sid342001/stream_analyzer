@@ -107,28 +107,36 @@ class Perception:
             self.dinov3_weights, device_map=self.device, attn_implementation="sdpa"
         ).eval()
 
-    def detect_track(self, frame: np.ndarray, concepts: list[Concept]) -> list[Detection]:
-        """Tier-1: detect + segment + track every concept instance in `frame`.
+    def detect_track(self, frame: np.ndarray, concepts: list[Concept],
+                     want_masks: bool = True) -> list[Detection]:
+        """Tier-1: detect + segment every concept instance in `frame`.
 
         `frame` is a decoded HxWx3 RGB array handed straight from the pipeline —
         no encode/decode round-trip.
+
+        `want_masks=False` skips RLE-encoding the segmentation masks. The live
+        pipeline only consumes boxes and scores, and encoding a full-resolution
+        mask per detection per frame is expensive — so the backend passes False.
+        The default stays True so existing callers (service.py's debug API) keep
+        their exact output.
 
         NOTE: this calls SAM 3's single-image API fresh per frame, so
         `track_id` here is just an incrementing counter, NOT a real persistent
         identity. For real cross-frame tracking, swap to
         `sam3.model_builder.build_sam3_video_predictor` + `handle_request()`
         with one `inference_state` per stream, kept alive across calls — that's
-        what actually maintains track IDs. Wire that in once this is called
-        from a per-stream loop in the backend rather than one frame at a time.
+        what actually maintains track IDs. `backend/app/tracker.py` currently
+        papers over this with greedy IOU matching.
         """
         # SAM 3's weights are bfloat16; its own predictor code always runs inference
         # inside torch.autocast(dtype=bfloat16) (see sam3_base_predictor.py) — without
         # it, set_image()'s float32 input mismatches the model's dtype.
         autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.device == "cuda" else nullcontext()
         with autocast:
-            return self._detect_track_sam3(frame, concepts)
+            return self._detect_track_sam3(frame, concepts, want_masks)
 
-    def _detect_track_sam3(self, frame: np.ndarray, concepts: list[Concept]) -> list[Detection]:
+    def _detect_track_sam3(self, frame: np.ndarray, concepts: list[Concept],
+                           want_masks: bool) -> list[Detection]:
         detections: list[Detection] = []
         # set_image()'s ndarray/tensor branch reads `height, width = image.shape[-2:]`,
         # which assumes channel-first (C,H,W); our frames are channel-last (H,W,C), so
@@ -136,13 +144,21 @@ class Perception:
         # garbage boxes. The PIL.Image branch reads `.size` correctly regardless.
         pil_frame = Image.fromarray(frame)
 
+        # ONE vision-backbone pass for the whole frame, reused by every concept.
+        # set_image() runs the (expensive) image encoder and stores the result in
+        # state["backbone_out"]; set_text_prompt() then merges the text features
+        # into that same dict and runs only the grounding decoder. Its own source
+        # comment — "will erase the previous text prompt if any" — confirms
+        # calling it repeatedly against one state is the intended pattern.
+        #
+        # This used to sit inside the concept loop, so an N-concept watch-list
+        # paid for N identical full-frame encodes per detection pass. The
+        # backbone is prompt-independent, so that was pure waste.
+        state = self._sam_processor.set_image(pil_frame)
+
         for concept in concepts:
             if not concept.text_prompt:
                 continue
-            # set_image() only initializes state; set_text_prompt() is what actually
-            # runs inference, returning the state dict populated with boxes/masks/
-            # scores (already scaled to the original frame size).
-            state = self._sam_processor.set_image(pil_frame)
             if concept.exemplar_boxes:
                 # Not wired up — see module docstring for why (DINOv3 routing
                 # instead). Would look like:
@@ -151,18 +167,24 @@ class Perception:
                 #           box=list(box), label=True, state=state)
                 pass
             state = self._sam_processor.set_text_prompt(prompt=concept.text_prompt, state=state)
-            boxes, masks, scores = state["boxes"], state["masks"], state["scores"]
 
-            for i in range(boxes.shape[0]):
+            # One device sync per concept rather than three-or-four per
+            # detection: pull the whole tensors across at once.
+            boxes = state["boxes"].cpu().tolist()
+            scores = state["scores"].cpu().tolist()
+            masks = state["masks"] if want_masks else None
+
+            for i, (box_xyxy, score) in enumerate(zip(boxes, scores)):
                 self._next_track_id += 1
-                mask_np = masks[i, 0].cpu().numpy()
-                box = tuple(int(v) for v in boxes[i].tolist())
+                mask_rle = ""
+                if masks is not None:
+                    mask_rle = _encode_mask_rle(masks[i, 0].cpu().numpy())
                 detections.append(Detection(
                     track_id=self._next_track_id,
                     concept=concept.label,
-                    box=box,
-                    mask_rle=_encode_mask_rle(mask_np),
-                    score=float(scores[i]),
+                    box=tuple(int(v) for v in box_xyxy),
+                    mask_rle=mask_rle,
+                    score=float(score),
                 ))
         return detections
 

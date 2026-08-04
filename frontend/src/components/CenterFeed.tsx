@@ -7,7 +7,21 @@ import { useStore } from "@/store/useStore";
 import { fmtClock } from "@/lib/utils";
 import type { TrackedObject } from "@/lib/types";
 
-/** Draws the live UAV frame + SAM-3 style overlays onto a canvas. */
+/** How far past the last detection we're willing to extrapolate a box, in
+ *  seconds. Beyond this the box freezes where it is: a frozen box honestly
+ *  reads as "stale", whereas one that keeps coasting is an active lie about
+ *  where the object is. Roughly 1.5x the expected detection period. */
+const MAX_EXTRAPOLATE_S = 0.35;
+
+/** Draws the live UAV frame + SAM-3 style overlays onto a canvas.
+ *
+ *  `trackAgeS` is how long ago the current track set arrived. Detection runs
+ *  at a few Hz while this renders at ~60Hz, so box centres are extrapolated
+ *  from each track's velocity to keep motion smooth between detections. Only
+ *  the centre is extrapolated — never size, score or label, which have no
+ *  velocity signal and would just jitter. The server is never asked to invent
+ *  detections; this is purely presentational.
+ */
 function render(
   ctx: CanvasRenderingContext2D,
   w: number,
@@ -15,6 +29,7 @@ function render(
   tracks: TrackedObject[],
   t: number,
   frameImg: HTMLImageElement | null,
+  trackAgeS: number,
 ) {
   if (frameImg && frameImg.complete && frameImg.naturalWidth > 0) {
     // real decoded video frame (backend/app/pipeline.py's "frame" messages)
@@ -59,11 +74,17 @@ function render(
   }
 
   // tracked objects: trail, mask glow, box, label
+  const age = Math.min(trackAgeS, MAX_EXTRAPOLATE_S);
+  // Fade boxes once we're past roughly one detection period, so an operator
+  // can see at a glance which boxes are measured and which are predicted.
+  const stale = trackAgeS > MAX_EXTRAPOLATE_S;
   for (const o of tracks) {
-    const x = o.x * w;
-    const y = o.y * h;
+    // vx/vy are normalized units per second (see backend/app/tracker.py)
+    const x = (o.x + o.vx * age) * w;
+    const y = (o.y + o.vy * age) * h;
     const bw = o.w * w;
     const bh = o.h * h;
+    ctx.globalAlpha = stale ? 0.55 : 1;
 
     if (o.trail.length > 1) {
       ctx.strokeStyle = o.color + "66";
@@ -106,6 +127,7 @@ function render(
     ctx.font = "10px ui-monospace, monospace";
     ctx.fillText(`${Math.round(o.score * 100)}%`, x0 + bw - 22, y0 + bh + 12);
   }
+  ctx.globalAlpha = 1;
 
   // center reticle
   ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -156,7 +178,20 @@ export function CenterFeed() {
   const [drawing, setDrawing] = useState(false);
   const [newName, setNewName] = useState("");
   const [fps, setFps] = useState(0);
+  const [detectFps, setDetectFps] = useState(0);
   const frameCountRef = useRef(0);
+  const detectCountRef = useRef(0);
+
+  // The render loop must not restart when tracks change (that would reset the
+  // animation and defeat time-based interpolation), so it reads tracks and
+  // their arrival time through refs rather than closing over the values.
+  const tracksRef = useRef(tracks);
+  const tracksAtRef = useRef(performance.now());
+  useEffect(() => {
+    tracksRef.current = tracks;
+    tracksAtRef.current = performance.now();
+    detectCountRef.current += 1;
+  }, [tracks]);
 
   // decode incoming JPEG data URLs off the render loop — the <img> just
   // holds whatever finished decoding most recently, draw() below reads it
@@ -168,13 +203,15 @@ export function CenterFeed() {
     }
   }, [frame]);
 
-  // measured, not assumed — counts actual "frame" messages received per
-  // second, so this reflects real stream/network health (backend/app/config.py's
-  // DISPLAY_FPS is only a target)
+  // Both rates are measured, not assumed — display and detection run at
+  // deliberately different rates (see backend/app/pipeline.py), so showing
+  // only one number invites confusing the two.
   useEffect(() => {
     const id = setInterval(() => {
       setFps(frameCountRef.current);
+      setDetectFps(detectCountRef.current);
       frameCountRef.current = 0;
+      detectCountRef.current = 0;
     }, 1000);
     return () => clearInterval(id);
   }, []);
@@ -193,13 +230,17 @@ export function CenterFeed() {
         canvas.height = rect.height * dpr;
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      render(ctx, rect.width, rect.height, tracks, t, frameImgRef.current);
+      const ageS = (performance.now() - tracksAtRef.current) / 1000;
+      render(ctx, rect.width, rect.height, tracksRef.current, t, frameImgRef.current, ageS);
       t += 1;
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [tracks]);
+    // Empty deps on purpose: this loop runs for the component's lifetime and
+    // reads live values through refs. Adding `tracks` here would tear down and
+    // recreate the RAF loop on every detection message.
+  }, []);
 
   return (
     <div className="flex h-full flex-col gap-2">
@@ -224,7 +265,7 @@ export function CenterFeed() {
           </Badge>
         </div>
         <div className="font-mono text-xs text-muted-foreground">
-          {fmtClock(now)} · {fps} fps · {tracks.length} tracks
+          {fmtClock(now)} · {fps} fps video · {detectFps} fps detect · {tracks.length} tracks
         </div>
       </div>
 

@@ -94,7 +94,11 @@ class ConceptStore:
         with self._lock:
             record = self._records.get(concept_id)
             if record is not None:
-                record.reference_embeddings.append(embedding)
+                # Copy-on-write, not .append(): the detection thread iterates
+                # this list while matching exemplars, and appending in place
+                # mutates a list another thread is mid-read on. Rebinding means
+                # readers always hold a consistent immutable snapshot.
+                record.reference_embeddings = record.reference_embeddings + [embedding]
             return record
 
     def set_enabled(self, concept_id: str, enabled: bool) -> ConceptRecord | None:

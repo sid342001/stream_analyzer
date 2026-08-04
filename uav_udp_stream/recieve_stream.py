@@ -135,7 +135,7 @@ import threading
 import queue
 from collections import deque
 
-UDP_URL = "udp://127.0.0.1:5601?fifo_size=1000000&overrun_nonfatal=1"
+UDP_URL = "udp://127.0.0.1:5600?fifo_size=1000000&overrun_nonfatal=1"
 
 # Optional KLV decoder
 try:

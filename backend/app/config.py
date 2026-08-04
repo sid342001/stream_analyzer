@@ -25,24 +25,47 @@ class Settings:
     perception_backend: str = os.environ.get("PERCEPTION_BACKEND", "sam3")
     sam_weights: str = os.environ.get("SAM_WEIGHTS", "/models/sam3")
     dinov3_weights: str = os.environ.get("DINOV3_WEIGHTS", "/models/dinov3-vitl16")
-    sample_fps: float = float(os.environ.get("SAMPLE_FPS", "6"))
+    # Upper bound on how often detection runs, NOT a pacing mechanism — the
+    # detection thread is self-pacing (it always takes the newest frame and
+    # loops), so this only exists to deliberately leave GPU headroom. Set it
+    # high to let detection run flat out.
+    sample_fps: float = float(os.environ.get("SAMPLE_FPS", "5"))
 
     # ---- display: video frames sent to the frontend for CenterFeed's canvas ---
-    # Separate from sample_fps (the detection rate) on purpose — the video
-    # should play smoothly even though SAM3/DINOv3 only run a few times a
-    # second; JPEG quality is capped for WebSocket bandwidth, not the video's
-    # actual quality.
-    display_fps: float = float(os.environ.get("DISPLAY_FPS", "12"))
+    # Separate from sample_fps (the detection rate) on purpose, and served by a
+    # separate thread — the video plays smoothly even though SAM3/DINOv3 only
+    # manage a few frames a second.
+    display_fps: float = float(os.environ.get("DISPLAY_FPS", "15"))
     display_jpeg_quality: int = int(os.environ.get("DISPLAY_JPEG_QUALITY", "70"))
+    # Downscale before JPEG encoding. The console's video panel is far smaller
+    # than a 1280px-wide frame, so shrinking here costs nothing visually and
+    # saves both encode time and WebSocket bandwidth. 0 disables downscaling.
+    display_max_width: int = int(os.environ.get("DISPLAY_MAX_WIDTH", "960"))
 
     # ---- VLM: OpenAI-compatible endpoint (vllm or the llama.cpp standby) -----
     vlm_base_url: str = os.environ.get("VLM_BASE_URL", "http://localhost:8080/v1")
     vlm_model: str = os.environ.get("VLM_MODEL_NAME", "uav-vlm")
     vlm_timeout_s: float = float(os.environ.get("VLM_TIMEOUT_S", "30"))
+    # Tier-2 description calls run on their own small thread pool so a slow or
+    # dead VLM can never stall detection (let alone video). If more than
+    # `vlm_max_pending` jobs are already queued we skip the call and use the
+    # fallback label rather than piling 30s requests onto one vLLM instance.
+    #
+    # Concurrency of 1 is deliberate and measured: vLLM and SAM 3 share one
+    # GPU, and concurrent VLM inference is what dominates detection tail
+    # latency. Observed on an RTX 5000 Ada with 4 concepts — detection p50
+    # 485ms / p95 ~3500ms while VLM calls were in flight, versus p50 169ms /
+    # p95 191ms with the VLM idle. Raising this trades detection smoothness
+    # for faster event descriptions.
+    vlm_max_concurrency: int = int(os.environ.get("VLM_MAX_CONCURRENCY", "1"))
+    vlm_max_pending: int = int(os.environ.get("VLM_MAX_PENDING", "3"))
 
     # ---- tracker (backend/app/tracker.py) -------------------------------------
     track_iou_threshold: float = float(os.environ.get("TRACK_IOU_THRESHOLD", "0.3"))
-    track_max_missed_frames: int = int(os.environ.get("TRACK_MAX_MISSED_FRAMES", "10"))
+    # Wall-clock, not a frame count: the detection interval is variable now
+    # (the detection thread is self-pacing), so "N missed frames" would mean a
+    # different amount of real time at every rate.
+    track_max_missed_s: float = float(os.environ.get("TRACK_MAX_MISSED_S", "1.0"))
 
     # ---- exemplar matching: DINOv3 cosine similarity gate ----------------------
     # SAM 3's text prompt casts a wide net; a concept with authored exemplars
@@ -51,6 +74,12 @@ class Settings:
     # model_servers/perception/tools/test_inference.py. Concepts with zero
     # exemplars skip this gate (nothing to compare against yet).
     match_threshold: float = float(os.environ.get("MATCH_THRESHOLD", "0.55"))
+
+    # ---- observability ------------------------------------------------------
+    # Rolling per-stage timing + throughput summary, logged this often.
+    # 0 disables. Counters are plain ints incremented without a lock, so they
+    # are approximate — fine for logging, don't build logic on them.
+    perf_log_interval_s: float = float(os.environ.get("PERF_LOG_INTERVAL_S", "10"))
 
     # ---- server -----------------------------------------------------------------
     host: str = os.environ.get("BACKEND_HOST", "0.0.0.0")

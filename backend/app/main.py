@@ -11,6 +11,7 @@ import json
 import logging
 import queue
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -29,35 +30,90 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 pipeline = Pipeline(settings, concept_store)
-_message_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
 _stop_event = threading.Event()
 _connections: set[WebSocket] = set()
 
+# Message types whose payload is a full-state snapshot: a newer one totally
+# supersedes an older one, so an undelivered old one is worthless and is
+# coalesced away rather than queued. `event` is deliberately NOT in here —
+# events are the product, and dropping one is a correctness failure.
+_COALESCING = ("frame", "tracks", "telemetry")
+# Drain order: events first, video last. A flood of ~100KB frames must never
+# delay, let alone evict, an event — which the previous single shared queue
+# allowed.
+_DRAIN_ORDER = ("event", "telemetry", "tracks", "frame")
+
+
+class _Outbox:
+    """Per-type outbound buffering, replacing the old single shared queue.
+
+    The old design had one Queue(maxsize=1000) with type-blind drop-oldest, so
+    a burst of display frames could silently evict an event. Here snapshot
+    types get a one-slot coalescing buffer and events get a real queue.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: dict[str, str] = {}
+        self._events: deque[str] = deque(maxlen=1000)
+        self._wakeup = threading.Event()
+
+    def publish(self, message: dict[str, Any]) -> None:
+        """Called from pipeline threads. Never blocks."""
+        kind = message.get("type", "")
+        # Serialize on the producer thread so the event loop does no CPU work
+        # per message.
+        text = json.dumps(message)
+        with self._lock:
+            if kind in _COALESCING:
+                self._latest[kind] = text
+            else:
+                if len(self._events) == self._events.maxlen:
+                    logger.error("event backlog full — dropping oldest event")
+                self._events.append(text)
+        self._wakeup.set()
+
+    def drain(self) -> list[str]:
+        with self._lock:
+            out = list(self._events)
+            self._events.clear()
+            for kind in _DRAIN_ORDER:
+                if kind == "event":
+                    continue
+                text = self._latest.pop(kind, None)
+                if text is not None:
+                    out.append(text)
+            return out
+
+    def wait(self, timeout: float) -> bool:
+        got = self._wakeup.wait(timeout)
+        if got:
+            self._wakeup.clear()
+        return got
+
+
+_outbox = _Outbox()
+
 
 def _on_pipeline_message(message: dict[str, Any]) -> None:
-    """Called from the background pipeline thread — must stay non-blocking
-    and thread-safe. Drop-oldest under backpressure rather than block the
-    inference loop on a slow WebSocket consumer."""
-    try:
-        _message_queue.put_nowait(message)
-    except queue.Full:
-        try:
-            _message_queue.get_nowait()
-        except queue.Empty:
-            pass
-        _message_queue.put_nowait(message)
+    _outbox.publish(message)
 
 
 async def _broadcast_loop() -> None:
     while True:
-        message = await asyncio.to_thread(_message_queue.get)
-        if not _connections:
+        # Block in a worker thread so the event loop stays free; one wait per
+        # batch rather than the old one-threadpool-dispatch-per-message.
+        got = await asyncio.to_thread(_outbox.wait, 0.5)
+        if not got:
             continue
-        text = json.dumps(message)
+        messages = _outbox.drain()
+        if not messages or not _connections:
+            continue
         dead = set()
-        for ws in _connections:
+        for ws in list(_connections):
             try:
-                await ws.send_text(text)
+                for text in messages:
+                    await ws.send_text(text)
             except Exception:
                 dead.add(ws)
         _connections.difference_update(dead)
@@ -68,16 +124,22 @@ async def lifespan(app: FastAPI):
     pipeline.load()
     concept_store.seed(["person", "vehicle", "tent", "fire"])
 
-    pipeline_thread = threading.Thread(
-        target=pipeline.run, args=(_on_pipeline_message, _stop_event), daemon=True
-    )
-    pipeline_thread.start()
+    threads = pipeline.start(_on_pipeline_message, _stop_event)
     broadcast_task = asyncio.create_task(_broadcast_loop())
 
     yield
 
     _stop_event.set()
+    # Wake any thread blocked waiting for a frame so it can see the stop event.
+    pipeline.shutdown()
     broadcast_task.cancel()
+    # Join rather than relying on daemon=True: the ingest thread must return
+    # under its own power so its generator's `with av.open(...)` unwinds and
+    # frees the UDP socket. Bounded by ingest.py's read timeout.
+    for t in threads:
+        t.join(timeout=15)
+        if t.is_alive():
+            logger.warning("thread %s did not exit cleanly", t.name)
 
 
 app = FastAPI(title="uav-stream-analyzer-backend", lifespan=lifespan)
@@ -166,19 +228,40 @@ async def add_exemplar(
     record = concept_store.get(concept_id)
     if record is None:
         raise HTTPException(status_code=404, detail="unknown concept_id")
+    if pipeline.perception is None:
+        raise HTTPException(status_code=503, detail="perception models still loading")
 
     try:
-        box_coords = tuple(json.loads(box))
+        # int(): Perception._crop slices the frame with these, and numpy
+        # rejects float slice indices.
+        box_coords = tuple(int(v) for v in json.loads(box))
         if len(box_coords) != 4:
             raise ValueError
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="box must be a JSON [x1, y1, x2, y2] array")
 
-    frame = np.array(Image.open(io.BytesIO(await image.read())).convert("RGB"))
-    fake_detection = Detection(track_id=0, concept=record.label, box=box_coords, mask_rle="", score=1.0)
-    [embedded] = pipeline.perception.embed(frame, [fake_detection])
+    raw = await image.read()
 
-    updated = concept_store.add_exemplar_embedding(concept_id, embedded.embedding)
+    def _embed_job() -> list[float]:
+        # Runs on the detection thread — the only thread allowed to touch
+        # CUDA. Image decoding is in here too so it never lands on the event
+        # loop.
+        frame = np.array(Image.open(io.BytesIO(raw)).convert("RGB"))
+        det = Detection(track_id=0, concept=record.label, box=box_coords, mask_rle="", score=1.0)
+        [embedded] = pipeline.perception.embed(frame, [det])
+        return embedded.embedding
+
+    try:
+        future = pipeline.submit_gpu(_embed_job)
+    except queue.Full:
+        raise HTTPException(status_code=503, detail="GPU queue saturated, retry shortly")
+
+    try:
+        embedding = await asyncio.wait_for(asyncio.wrap_future(future), timeout=60)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="embedding timed out")
+
+    updated = concept_store.add_exemplar_embedding(concept_id, embedding)
     assert updated is not None
     return updated.to_public()
 

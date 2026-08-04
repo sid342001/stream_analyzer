@@ -18,10 +18,8 @@ already a complete KLV Local Set ready for decode_to_dict().
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
 
 import av
-import numpy as np
 
 from uavstream.klv import checksum_ok, decode_to_dict
 
@@ -52,13 +50,30 @@ def _to_telemetry(values: dict[str, object]) -> dict[str, float] | None:
     return out
 
 
-def frames(stream_url: str) -> Iterator[tuple[np.ndarray | None, dict[str, float] | None]]:
-    """Yield (frame, telemetry) pairs from the live stream — exactly one of
-    the pair is set per item: an HxWx3 RGB frame, or a decoded telemetry dict.
+def frames(stream_url: str, open_timeout_s: float = 30.0, read_timeout_s: float = 5.0):
+    """Yield (video_frame, telemetry) pairs from the live stream — exactly one
+    of the pair is set per item: a PyAV `VideoFrame`, or a decoded telemetry
+    dict.
+
+    Yields the **undecoded PyAV frame**, not an ndarray, on purpose: converting
+    to RGB is a full swscale pass plus an allocation, and at a 25-30fps source
+    most frames are dropped by the display/detection rate gates. The caller
+    decides whether a frame is wanted before paying for `to_ndarray()`.
 
     Blocking generator — run it in a background thread, not the asyncio event
     loop (see app/pipeline.py). The caller is responsible for remembering the
     last-seen telemetry between updates (this only reports what changed).
+
+    `read_timeout_s` matters for shutdown: without it, a silent UDP source
+    leaves `demux()` blocked in FFmpeg forever and the owning thread can never
+    observe its stop event.
+
+    `open_timeout_s` must stay well above FFmpeg's `analyzeduration` (below),
+    because opening a live stream includes probing it for format. Passing a
+    single scalar `timeout=` applies it to *both* phases, which makes a short
+    read timeout also cap probing — that fails with
+    `ExitError: Immediate exit requested` before the stream is ever opened.
+    Hence the (open, read) tuple.
     """
     # fifo_size/overrun_nonfatal are udp:// protocol options, not generic
     # AVFormatContext options, so they belong on the URL query string, not in
@@ -67,7 +82,19 @@ def frames(stream_url: str) -> Iterator[tuple[np.ndarray | None, dict[str, float
     # kernel socket buffer and abort the whole demux with "Circular buffer
     # overrun", observed during testing.
     if stream_url.startswith("udp://") and "?" not in stream_url:
-        stream_url = f"{stream_url}?fifo_size=1000000&overrun_nonfatal=1"
+        # fifo_size: 5MB (up from 1MB). Now that the ingest thread never blocks
+        # on inference this shouldn't overrun at all, but the headroom is free
+        # and absorbs I-frame bursts.
+        #
+        # reuse=1 (SO_REUSEADDR) is not optional here, it's what makes retries
+        # survivable. If av.open() raises *during* opening — e.g. the probe
+        # times out because the source went briefly quiet — the exception comes
+        # from av.open() itself, so the `with` block below is never entered and
+        # its __exit__ never runs. The half-open container's socket is left
+        # bound to this port with no Python reference able to close it, and
+        # every later retry then fails to bind, permanently, until the process
+        # restarts. SO_REUSEADDR lets the next attempt bind anyway.
+        stream_url = f"{stream_url}?fifo_size=5000000&overrun_nonfatal=1&reuse=1"
 
     logger.info("opening stream: %s", stream_url)
     # `with` is required, not optional cleanup: if this generator is abandoned
@@ -76,7 +103,19 @@ def frames(stream_url: str) -> Iterator[tuple[np.ndarray | None, dict[str, float
     # leaks its underlying UDP socket. The next attempt then fails to rebind
     # the same address ("Address already in use") until the process exits —
     # confirmed by hitting exactly that during testing.
-    with av.open(stream_url, options={"fflags": "nobuffer", "flags": "low_delay"}) as container:
+    with av.open(
+        stream_url,
+        options={
+            "fflags": "nobuffer",
+            "flags": "low_delay",
+            # Cut probing from FFmpeg's 5s default. We know what this stream
+            # is (H.264 + KLV in MPEG-TS), so a long analyzeduration only
+            # delays startup and every reconnect.
+            "analyzeduration": "1000000",  # microseconds
+            "probesize": "500000",         # bytes
+        },
+        timeout=(open_timeout_s, read_timeout_s),
+    ) as container:
         video_stream = next((s for s in container.streams if s.type == "video"), None)
         data_stream = next((s for s in container.streams if s.type == "data"), None)
         if video_stream is None:
@@ -87,7 +126,7 @@ def frames(stream_url: str) -> Iterator[tuple[np.ndarray | None, dict[str, float
         for packet in container.demux():
             if packet.stream.type == "video":
                 for frame in packet.decode():
-                    yield frame.to_ndarray(format="rgb24"), None
+                    yield frame, None
             elif packet.stream.type == "data":
                 # av.Packet has no to_bytes() (that was recieve_stream.py's
                 # assumption, unverified) — it implements the buffer protocol,
