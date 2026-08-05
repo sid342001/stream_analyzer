@@ -6,7 +6,7 @@
  * opens `/ws`, and emit the same events (`onFrame`, `onEvent`, `onTelemetry`).
  * The rest of the app depends only on the `Feed` interface below.
  */
-import type { EventItem, Severity, TrackedObject, Telemetry } from "./types";
+import type { EventItem, Severity, StreamStatus, TrackedObject, Telemetry } from "./types";
 
 export interface FeedHandlers {
   onTracks: (tracks: TrackedObject[]) => void;
@@ -15,6 +15,9 @@ export interface FeedHandlers {
   /** JPEG data URL for one decoded video frame. Optional: MockFeed has no
    * real video to simulate, only WsFeed calls this. */
   onFrame?: (dataUrl: string) => void;
+  /** Live-source connection state. Optional: MockFeed has no real source to
+   * report on, only WsFeed calls this. */
+  onStatus?: (s: StreamStatus) => void;
 }
 
 export interface Feed {
@@ -181,13 +184,4 @@ export class MockFeed implements Feed {
     };
     this.handlers.onEvent(ev);
   }
-}
-
-/** Canned Tier-3 answers for the scoped Q&A (until the VLM is wired). */
-export function mockAnswer(question: string, ev: EventItem): string {
-  const q = question.toLowerCase();
-  if (q.includes("how many")) return `3 people are within the tent cluster in this frame; track #${ev.trackId} is the closest.`;
-  if (q.includes("vehicle") && q.includes("first")) return `The vehicle first appeared at 14:19:12, entering from the north-west edge.`;
-  if (q.includes("what")) return `A single person moving at ~1.3 m/s toward two tents; heading is steady, no other subjects nearby.`;
-  return `Based on the pinned frame (track #${ev.trackId}, ${ev.kind}): ${ev.description}`;
 }

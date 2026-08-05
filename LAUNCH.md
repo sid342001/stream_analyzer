@@ -144,6 +144,10 @@ container still starts fine, but Tier-2 VLM calls will fail until it is.
 | `TRACK_IOU_THRESHOLD` | `0.3` | Minimum box overlap to match a detection to an existing track between frames (`backend/app/tracker.py`). |
 | `TRACK_MAX_MISSED_FRAMES` | `10` | How many consecutive frames a track can go undetected before being dropped. |
 | `MATCH_THRESHOLD` | `0.55` | DINOv3 cosine-similarity gate for concepts with authored exemplars — see §5. |
+| `CONTEXT_CROP_MARGIN` | `0.6` | How far the Tier-2/Tier-3 evidence crop expands past the tracked box, as a fraction of the box's own size — `0.6` ≈ 2.2x. Both the "what is this doing" VLM call and the Tier-3 chat evidence image use this crop. |
+| `SCENE_INTERVAL_S` | `8.0` | How often (seconds) Tier-2 runs a whole-frame scene overview — see §5.1. One VLM call per interval tick, **not** one per detected object, so this is the flat, predictable Tier-2 cost knob regardless of how busy the scene is. Individual objects are queryable on demand instead (Objects tab → `GET /api/tracks/{id}/snapshot`), not automatically analyzed. |
+| `EXEMPLAR_RECALL_BACKEND` | `both` | `sam3` \| `yoloe26` \| `both` — which recall source(s) run for concepts *with* authored exemplars (concepts without any always use SAM 3 text-prompt recall regardless). See "`EXEMPLAR_RECALL_BACKEND` cost" below for the measured overhead, and `app/config.py`'s docstring — `sam3` is the rollback switch if YOLOE-26 doesn't work out. |
+| `YOLOE_WEIGHTS` | `/models/yoloe-26/yoloe-26s-seg.pt` | Path inside the container. Only loaded when `EXEMPLAR_RECALL_BACKEND` is `yoloe26` or `both`. |
 | `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | `1` | Never phone home; weights are already local. |
 
 To change any of these without editing `docker-compose.yml`, export them
@@ -339,6 +343,24 @@ Three things worth internalising:
 
 So the two levers that actually matter are **how much Tier-2 VLM traffic you
 generate** and **how many concepts you leave enabled** — in that order.
+
+### `EXEMPLAR_RECALL_BACKEND` cost (YOLOE-26 visual-prompt recall)
+
+Measured with vLLM stopped (isolates the pure detection cost from VLM
+contention above), one concept with one authored exemplar:
+
+| `EXEMPLAR_RECALL_BACKEND` | Detection p50 | Detection p95 |
+|---|---|---|
+| `sam3` (YOLOE-26 not loaded) | 413 ms | 452 ms |
+| `both` (SAM 3 + YOLOE-26 for that concept) | 1106-1133 ms | 1218-1665 ms |
+
+YOLOE-26's exemplar-baked visual-prompt pass adds roughly **+700 ms** on top
+of the SAM 3 + DINOv3 baseline for each concept that has exemplars — a
+second full model forward pass, not free. It's only paid for concepts that
+actually have authored exemplars (see `app/pipeline.py`'s `_process_frame`),
+so a watch-list where most concepts are still text-prompt-only sees little
+of this. `EXEMPLAR_RECALL_BACKEND=sam3` reverts to the pre-YOLOE cost
+exactly (see `app/config.py`'s docstring — it's the rollback switch).
 
 ---
 

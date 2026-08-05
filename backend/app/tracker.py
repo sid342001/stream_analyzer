@@ -22,6 +22,7 @@ rate.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 
@@ -65,12 +66,29 @@ class Tracker:
         self.max_missed_s = max_missed_s
         self._tracks: dict[int, Track] = {}
         self._next_id = 1
+        # update()/reset() run exclusively on the detection thread; get_box()
+        # is read from the event loop (main.py's on-demand object-snapshot
+        # endpoint) — same simple whole-method locking ConceptStore already
+        # uses, not fine-grained per-field.
+        self._lock = threading.Lock()
+
+    def get_box(self, track_id: int) -> tuple[str, tuple[int, int, int, int]] | None:
+        """Thread-safe (concept, box) snapshot of a currently-live track, or
+        None if it isn't live (coasted out, or never existed) — a real,
+        expected case, not an error: an operator can click an object that
+        vanishes between seeing it and querying it."""
+        with self._lock:
+            track = self._tracks.get(track_id)
+            if track is None:
+                return None
+            return track.concept, track.box
 
     def reset(self) -> None:
         """Drop all state. Called when the stream reconnects — after a gap, old
         tracks would IOU-match unrelated content in the new scene and suppress
         the first-appearance events that genuinely new objects should fire."""
-        self._tracks.clear()
+        with self._lock:
+            self._tracks.clear()
 
     def update(
         self,
@@ -89,72 +107,73 @@ class Tracker:
         for that call — callers use `is_new` to fire "first appearance" events
         exactly once per track.
         """
-        unmatched_dets = list(range(len(detections)))
-        unmatched_tracks = list(self._tracks.keys())
+        with self._lock:
+            unmatched_dets = list(range(len(detections)))
+            unmatched_tracks = list(self._tracks.keys())
 
-        # greedy best-IOU-first matching, same concept only
-        pairs = []
-        for tid in unmatched_tracks:
-            for di in unmatched_dets:
-                concept, box, _score = detections[di]
-                if concept != self._tracks[tid].concept:
+            # greedy best-IOU-first matching, same concept only
+            pairs = []
+            for tid in unmatched_tracks:
+                for di in unmatched_dets:
+                    concept, box, _score = detections[di]
+                    if concept != self._tracks[tid].concept:
+                        continue
+                    iou = _iou(self._tracks[tid].box, box)
+                    if iou >= self.iou_threshold:
+                        pairs.append((iou, tid, di))
+            pairs.sort(reverse=True)
+
+            matches: list[tuple[int, int]] = []
+            matched_tracks: set[int] = set()
+            matched_dets: set[int] = set()
+            for _iou_value, tid, di in pairs:
+                if tid in matched_tracks or di in matched_dets:
                     continue
-                iou = _iou(self._tracks[tid].box, box)
-                if iou >= self.iou_threshold:
-                    pairs.append((iou, tid, di))
-        pairs.sort(reverse=True)
+                matches.append((tid, di))
+                matched_tracks.add(tid)
+                matched_dets.add(di)
 
-        matches: list[tuple[int, int]] = []
-        matched_tracks: set[int] = set()
-        matched_dets: set[int] = set()
-        for _iou_value, tid, di in pairs:
-            if tid in matched_tracks or di in matched_dets:
-                continue
-            matches.append((tid, di))
-            matched_tracks.add(tid)
-            matched_dets.add(di)
+            unmatched_dets = [d for d in unmatched_dets if d not in matched_dets]
+            unmatched_tracks = [t for t in unmatched_tracks if t not in matched_tracks]
 
-        unmatched_dets = [d for d in unmatched_dets if d not in matched_dets]
-        unmatched_tracks = [t for t in unmatched_tracks if t not in matched_tracks]
+            for tid, di in matches:
+                concept, box, score = detections[di]
+                track = self._tracks[tid]
+                x1, y1, x2, y2 = box
+                nx, ny = (x1 + x2) / 2 / frame_w, (y1 + y2) / 2 / frame_h
+                if dt and dt > 0:
+                    track.vx, track.vy = (nx - track.norm_x) / dt, (ny - track.norm_y) / dt
+                else:
+                    track.vx = track.vy = 0.0
+                track.norm_x, track.norm_y = nx, ny
+                track.box = box
+                track.score = score
+                track.missed_s = 0.0
+                track.is_new = False
+                track.trail.append((nx, ny))
+                if len(track.trail) > 40:
+                    track.trail.pop(0)
 
-        for tid, di in matches:
-            concept, box, score = detections[di]
-            track = self._tracks[tid]
-            x1, y1, x2, y2 = box
-            nx, ny = (x1 + x2) / 2 / frame_w, (y1 + y2) / 2 / frame_h
-            if dt and dt > 0:
-                track.vx, track.vy = (nx - track.norm_x) / dt, (ny - track.norm_y) / dt
-            else:
+            for di in unmatched_dets:
+                concept, box, score = detections[di]
+                x1, y1, x2, y2 = box
+                nx, ny = (x1 + x2) / 2 / frame_w, (y1 + y2) / 2 / frame_h
+                track = Track(track_id=self._next_id, concept=concept, box=box,
+                              norm_x=nx, norm_y=ny, score=score)
+                track.trail.append((nx, ny))
+                self._tracks[track.track_id] = track
+                self._next_id += 1
+
+            for tid in unmatched_tracks:
+                track = self._tracks[tid]
+                track.missed_s += dt or 0.0
+                track.is_new = False
+                # Freeze coasting tracks in place. Letting them keep their last
+                # velocity would have the frontend extrapolate a box that is no
+                # longer backed by any detection steadily further from reality —
+                # a confident-looking box on empty ground.
                 track.vx = track.vy = 0.0
-            track.norm_x, track.norm_y = nx, ny
-            track.box = box
-            track.score = score
-            track.missed_s = 0.0
-            track.is_new = False
-            track.trail.append((nx, ny))
-            if len(track.trail) > 40:
-                track.trail.pop(0)
+                if track.missed_s > self.max_missed_s:
+                    del self._tracks[tid]
 
-        for di in unmatched_dets:
-            concept, box, score = detections[di]
-            x1, y1, x2, y2 = box
-            nx, ny = (x1 + x2) / 2 / frame_w, (y1 + y2) / 2 / frame_h
-            track = Track(track_id=self._next_id, concept=concept, box=box,
-                          norm_x=nx, norm_y=ny, score=score)
-            track.trail.append((nx, ny))
-            self._tracks[track.track_id] = track
-            self._next_id += 1
-
-        for tid in unmatched_tracks:
-            track = self._tracks[tid]
-            track.missed_s += dt or 0.0
-            track.is_new = False
-            # Freeze coasting tracks in place. Letting them keep their last
-            # velocity would have the frontend extrapolate a box that is no
-            # longer backed by any detection steadily further from reality —
-            # a confident-looking box on empty ground.
-            track.vx = track.vy = 0.0
-            if track.missed_s > self.max_missed_s:
-                del self._tracks[tid]
-
-        return list(self._tracks.values())
+            return list(self._tracks.values())

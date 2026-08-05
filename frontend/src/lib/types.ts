@@ -46,16 +46,38 @@ export interface EventItem {
   verdict: Verdict;
   tier: Tier;
   deepAnalyzed: boolean;
-  trackId: number;
+  // null for scene-overview events (see backend/app/pipeline.py's
+  // _queue_scene_analysis) — a periodic whole-frame narrative isn't about
+  // any one tracked object. Only set for events sourced from a specific track.
+  trackId: number | null;
   telemetry: Telemetry;
+  // Base64 JPEG data URL of the analyzed frame — the whole scene for a
+  // scene-overview event, or a margin crop for a track-scoped one (not the
+  // full frame either way — bounds memory) — and that image's own box
+  // coordinates, see backend/app/schemas.py. Undefined/null/empty when
+  // there's no object box (scene notes) or the crop failed; render a
+  // fallback rather than assuming presence.
+  image?: string | null;
+  box?: number[];
 }
 
-export interface Stream {
-  id: string;
-  name: string;
-  source: string; // udp://...
-  sensor: string; // EO / IR
-  online: boolean;
+// Response shape of GET /api/tracks/{id}/snapshot — a fresh, on-demand crop
+// of a currently-live object, for the Objects tab's "query" flow. Not
+// retained anywhere server-side; fetched fresh every time it's opened.
+export interface TrackSnapshot {
+  trackId: number;
+  image: string;
+  box: number[];
+  concept: string;
+  conceptColor: string;
+}
+
+// Mirrors backend/app/pipeline.py's "status" WS message — connection state
+// of the single live UDP source (see backend/app/config.py's stream_url).
+export interface StreamStatus {
+  connected: boolean;
+  url: string;
+  error: string | null;
 }
 
 export interface ChatMessage {

@@ -19,12 +19,26 @@ from app.schemas import Concept
 _DEFAULT_COLORS = ["#38bdf8", "#a78bfa", "#34d399", "#f87171", "#facc15", "#fb923c"]
 
 
+@dataclass(frozen=True)
+class Exemplar:
+    """One drawn/uploaded reference for a concept — everything downstream
+    needs: the DINOv3 embedding for the match gate, and the original
+    (thumbnail-sized) image + box so the VLM can be shown "what this concept
+    looks like" (see vlm_client.py) and so YOLOE-26 can bake a visual prompt
+    from it (see perception/interface.py's detect_by_exemplar)."""
+
+    image: str                     # base64 JPEG data URL, resized (~320px long side)
+    box: list[int]                 # [x1,y1,x2,y2] in image's own pixel coords
+    embedding: list[float]
+
+
 @dataclass
 class ConceptRecord:
     """Everything the backend needs for one watch-list entry — the public
     `Concept` fields the frontend expects, plus what detection actually runs
-    on (text_prompt for SAM 3, reference_embeddings for the DINOv3 match gate;
-    see model_servers/perception/README.md's "Context authoring" section)."""
+    on (text_prompt for SAM 3, exemplars for the DINOv3 match gate and (once
+    enabled) YOLOE-26 visual-prompt recall; see
+    model_servers/perception/README.md's "Context authoring" section)."""
 
     id: str
     label: str
@@ -32,7 +46,7 @@ class ConceptRecord:
     priority: str
     enabled: bool
     text_prompt: str
-    reference_embeddings: list[list[float]] = field(default_factory=list)
+    exemplars: list[Exemplar] = field(default_factory=list)
 
     def to_public(self) -> Concept:
         return Concept(
@@ -40,7 +54,7 @@ class ConceptRecord:
             label=self.label,
             color=self.color,
             priority=self.priority,  # type: ignore[arg-type]
-            exemplars=len(self.reference_embeddings),
+            exemplars=len(self.exemplars),
             enabled=self.enabled,
         )
 
@@ -90,7 +104,18 @@ class ConceptStore:
         with self._lock:
             return self._records.get(concept_id)
 
-    def add_exemplar_embedding(self, concept_id: str, embedding: list[float]) -> ConceptRecord | None:
+    def get_by_label(self, label: str) -> ConceptRecord | None:
+        """Used by /api/chat, which only has the event's concept *label*
+        (from the frontend store), not its id — linear scan is fine at this
+        scale, matches the rest of this store's simplicity."""
+        with self._lock:
+            for record in self._records.values():
+                if record.label == label:
+                    return record
+            return None
+
+    def add_exemplar(self, concept_id: str, image: str, box: list[int],
+                     embedding: list[float]) -> ConceptRecord | None:
         with self._lock:
             record = self._records.get(concept_id)
             if record is not None:
@@ -98,7 +123,7 @@ class ConceptStore:
                 # this list while matching exemplars, and appending in place
                 # mutates a list another thread is mid-read on. Rebinding means
                 # readers always hold a consistent immutable snapshot.
-                record.reference_embeddings = record.reference_embeddings + [embedding]
+                record.exemplars = record.exemplars + [Exemplar(image=image, box=box, embedding=embedding)]
             return record
 
     def set_enabled(self, concept_id: str, enabled: bool) -> ConceptRecord | None:

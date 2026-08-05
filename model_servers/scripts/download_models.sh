@@ -85,6 +85,29 @@ dl \
     --local-dir models/dinov3-vitl16
 
 ###############################################################################
+# YOLOE-26 (Ultralytics) — exemplar/visual-prompt recall alongside SAM 3
+###############################################################################
+# Not on Hugging Face — a plain GitHub release asset. URL confirmed by
+# actually running `ultralytics==8.4.115`'s own downloader against a real
+# install and observing what it fetched (see
+# model_servers/perception/interface.py's module docstring for why this
+# project verifies rather than assumes): it pulled from
+# github.com/ultralytics/assets' v8.4.0 release — hence the hardcoded
+# release tag below; bump ASSETS_RELEASE if a newer `ultralytics` moves it.
+# "s" size chosen as a starting point (small/fast — this only needs to run
+# for concepts that have exemplars, on a GPU already shared by SAM 3 +
+# DINOv3 + the VLM); override YOLOE_VARIANT for a larger/more accurate one.
+
+: "${YOLOE_VARIANT:=yoloe-26s-seg.pt}"
+: "${ASSETS_RELEASE:=v8.4.0}"
+
+mkdir -p models/yoloe-26
+curl -fL "https://github.com/ultralytics/assets/releases/download/${ASSETS_RELEASE}/${YOLOE_VARIANT}" \
+    -o "models/yoloe-26/${YOLOE_VARIANT}" \
+&& echo ">> saved models/yoloe-26/${YOLOE_VARIANT}" \
+|| echo "!! YOLOE-26 download failed — check YOLOE_VARIANT/ASSETS_RELEASE against https://github.com/ultralytics/assets/releases"
+
+###############################################################################
 
 echo
 echo "=============================================="

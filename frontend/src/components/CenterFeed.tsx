@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { Pause, Play, Crosshair, Plus, Layers } from "lucide-react";
+import { Pause, Play, Crosshair, Layers } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
+import { ContextAuthorDialog } from "@/components/ContextAuthorDialog";
 import { useStore } from "@/store/useStore";
 import { fmtClock } from "@/lib/utils";
+import * as api from "@/lib/api";
 import type { TrackedObject } from "@/lib/types";
 
 /** How far past the last detection we're willing to extrapolate a box, in
@@ -172,11 +173,16 @@ export function CenterFeed() {
   const frame = useStore((s) => s.frame);
   const playing = useStore((s) => s.playing);
   const setPlaying = useStore((s) => s.setPlaying);
-  const addConcept = useStore((s) => s.addConcept);
   const now = useStore((s) => s.now);
 
-  const [drawing, setDrawing] = useState(false);
-  const [newName, setNewName] = useState("");
+  // "Draw concept" fetches the hi-res still *first*, then shows it — pausing
+  // freezes frame N on screen, but the hi-res endpoint hands back whatever
+  // frame arrives next, so fetching first is what makes the frame the
+  // operator sees and the frame they draw on the same one. setPlaying(false)
+  // still fires, but only to stop the live canvas updating behind the modal.
+  const [context, setContext] = useState<{ imageSrc: string; imageBlob: Blob } | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
   const [fps, setFps] = useState(0);
   const [detectFps, setDetectFps] = useState(0);
   const frameCountRef = useRef(0);
@@ -252,17 +258,29 @@ export function CenterFeed() {
           </Button>
           <Button
             size="sm"
-            variant={drawing ? "default" : "outline"}
-            onClick={() => {
+            variant="outline"
+            disabled={capturing}
+            onClick={async () => {
               setPlaying(false);
-              setDrawing((d) => !d);
+              setCapturing(true);
+              setCaptureError(null);
+              try {
+                const dataUrl = await api.fetchHiresFrame();
+                const imageBlob = await (await fetch(dataUrl)).blob();
+                setContext({ imageSrc: dataUrl, imageBlob });
+              } catch (e) {
+                setCaptureError(e instanceof Error ? e.message : "failed to capture frame");
+              } finally {
+                setCapturing(false);
+              }
             }}
           >
-            <Crosshair /> Draw concept
+            <Crosshair /> {capturing ? "Capturing..." : "Draw concept"}
           </Button>
           <Badge variant="info" className="gap-1">
             <Layers className="h-3 w-3" /> Tier 1 · SAM 3 overlays
           </Badge>
+          {captureError && <span className="text-[11px] text-alert">{captureError}</span>}
         </div>
         <div className="font-mono text-xs text-muted-foreground">
           {fmtClock(now)} · {fps} fps video · {detectFps} fps detect · {tracks.length} tracks
@@ -283,42 +301,18 @@ export function CenterFeed() {
           <span className="h-2 w-2 animate-pulse-dot rounded-full bg-red-500" /> REC
         </div>
 
-        {drawing && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-            <div className="w-72 animate-fade-in rounded-lg border border-border bg-panel p-4 shadow-2xl">
-              <div className="mb-1 text-sm font-semibold">Teach a new concept</div>
-              <p className="mb-3 text-xs text-muted-foreground">
-                Frame paused. Name it and SAM 3 starts looking for it by text —
-                drawing example boxes for a tighter match isn't wired up yet.
-              </p>
-              <Input
-                autoFocus
-                placeholder="e.g. checkpoint, boat, cook-fire"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                className="mb-3"
-              />
-              <div className="flex justify-end gap-2">
-                <Button size="sm" variant="ghost" onClick={() => setDrawing(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={!newName.trim()}
-                  onClick={() => {
-                    addConcept(newName.trim());
-                    setNewName("");
-                    setDrawing(false);
-                    setPlaying(true);
-                  }}
-                >
-                  <Plus /> Add & go live
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
+
+      {context && (
+        <ContextAuthorDialog
+          imageSrc={context.imageSrc}
+          imageBlob={context.imageBlob}
+          onClose={() => {
+            setContext(null);
+            setPlaying(true);
+          }}
+        />
+      )}
     </div>
   );
 }

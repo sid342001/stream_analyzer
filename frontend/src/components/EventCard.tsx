@@ -16,8 +16,23 @@ const sevBadge: Record<Severity, "alert" | "watch" | "info"> = {
   info: "info",
 };
 
-/** A small procedural thumbnail so each card reads as a distinct frame. */
+/** The real analyzed-frame image retained for this event (see
+ *  backend/app/pipeline.py's _queue_scene_analysis) when there is one, else
+ *  a procedural placeholder for events from before that field existed. */
 function Thumb({ ev }: { ev: EventItem }) {
+  const label = ev.trackId != null ? `#${ev.trackId}` : "scene";
+  if (ev.image) {
+    return (
+      <div className="relative h-14 w-20 shrink-0 overflow-hidden rounded border border-border bg-[#0a1017]">
+        {/* eslint-disable-next-line jsx-a11y/alt-text */}
+        <img src={ev.image} className="h-full w-full object-cover" />
+        <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-1 py-0.5 font-mono text-[8px] text-emerald-300">
+          {label}
+        </div>
+      </div>
+    );
+  }
+  const seed = ev.trackId ?? 0;
   return (
     <div className="relative h-14 w-20 shrink-0 overflow-hidden rounded border border-border bg-[#0a1017]">
       <div className="absolute inset-0 grid-noise opacity-40" />
@@ -26,12 +41,12 @@ function Thumb({ ev }: { ev: EventItem }) {
         style={{
           borderColor: ev.conceptColor,
           background: ev.conceptColor + "33",
-          left: `${20 + (ev.trackId % 5) * 10}%`,
-          top: `${25 + (ev.trackId % 4) * 12}%`,
+          left: `${20 + (seed % 5) * 10}%`,
+          top: `${25 + (seed % 4) * 12}%`,
         }}
       />
       <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-1 py-0.5 font-mono text-[8px] text-emerald-300">
-        #{ev.trackId}
+        {label}
       </div>
     </div>
   );

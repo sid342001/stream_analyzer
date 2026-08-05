@@ -59,6 +59,38 @@ class Settings:
     # for faster event descriptions.
     vlm_max_concurrency: int = int(os.environ.get("VLM_MAX_CONCURRENCY", "1"))
     vlm_max_pending: int = int(os.environ.get("VLM_MAX_PENDING", "3"))
+    # How far the on-demand object snapshot (GET /api/tracks/{id}/snapshot)
+    # and Tier-3 chat evidence crop expand past the tracked box, as a
+    # fraction of the box's own width/height — 0.6 means the crop is ~2.2x
+    # the box's size (see pipeline.py's context_crop). Raising it gives the
+    # model more of the surrounding scene at the cost of the object itself
+    # rendering smaller within the fixed CONTEXT_CROP_MAX_SIDE pixel budget.
+    context_crop_margin: float = float(os.environ.get("CONTEXT_CROP_MARGIN", "0.6"))
+
+    # ---- Tier-2: periodic whole-frame scene analysis ---------------------------
+    # Replaces per-object first-appearance analysis: one VLM call per this
+    # many seconds, describing the whole frame, instead of one call per
+    # newly-appeared object. This number *is* the Tier-2 cost/freshness
+    # knob now — flat and predictable regardless of how many objects are on
+    # screen (see pipeline.py's _queue_scene_analysis). Individual objects
+    # stay queryable on demand via GET /api/tracks/{id}/snapshot.
+    scene_interval_s: float = float(os.environ.get("SCENE_INTERVAL_S", "8.0"))
+
+    # ---- YOLOE-26: exemplar/visual-prompt recall, alongside SAM 3's text-
+    # prompt recall — see model_servers/perception/interface.py's
+    # detect_by_exemplar and pipeline.py's _process_frame. Only applies to
+    # concepts that have authored exemplars; concepts without any always use
+    # SAM 3 text-prompt recall regardless of this setting.
+    #   "sam3"    -> text-prompt recall only (pre-this-phase behavior;
+    #                YOLOE-26 is never loaded or called)
+    #   "yoloe26" -> exemplar/visual-prompt recall only (skips SAM 3's text
+    #                pass for exemplar-bearing concepts)
+    #   "both"    -> union of both sources (default)
+    # Also the rollback switch: if YOLOE-26 integration doesn't verify
+    # cleanly, set this to "sam3" and behavior matches exactly what existed
+    # before this setting was added — no code change needed.
+    exemplar_recall_backend: str = os.environ.get("EXEMPLAR_RECALL_BACKEND", "both")
+    yoloe_weights: str = os.environ.get("YOLOE_WEIGHTS", "/models/yoloe-26/yoloe-26s-seg.pt")
 
     # ---- tracker (backend/app/tracker.py) -------------------------------------
     track_iou_threshold: float = float(os.environ.get("TRACK_IOU_THRESHOLD", "0.3"))

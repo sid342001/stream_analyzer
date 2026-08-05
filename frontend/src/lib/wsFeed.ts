@@ -9,7 +9,8 @@ type WireMessage =
   | { type: "frame"; data: unknown }
   | { type: "tracks"; data: unknown }
   | { type: "telemetry"; data: unknown }
-  | { type: "event"; data: unknown };
+  | { type: "event"; data: unknown }
+  | { type: "status"; data: unknown };
 
 const RECONNECT_DELAY_MS = 2000;
 
@@ -50,8 +51,15 @@ export class WsFeed implements Feed {
     // instantly where the proxied one kept failing. A production build (not
     // served by vite) falls back to same-origin /ws, e.g. behind a real
     // reverse proxy.
+    //
+    // location.hostname, not a hardcoded "localhost": this runs in the
+    // *browser*, so "localhost" would resolve to whatever machine opened the
+    // page — wrong the moment the console is loaded from another device on
+    // the LAN via the host's real IP. Using the same hostname the page
+    // itself was loaded with (whatever it is — localhost, a LAN IP, a
+    // hostname) always points back at the right backend.
     const url = import.meta.env.DEV
-      ? "ws://localhost:8000/ws"
+      ? `ws://${location.hostname}:8000/ws`
       : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
     this.ws = new WebSocket(url);
 
@@ -74,6 +82,9 @@ export class WsFeed implements Feed {
           break;
         case "event":
           this.handlers?.onEvent(msg.data as Parameters<FeedHandlers["onEvent"]>[0]);
+          break;
+        case "status":
+          this.handlers?.onStatus?.(msg.data as Parameters<NonNullable<FeedHandlers["onStatus"]>>[0]);
           break;
       }
     };

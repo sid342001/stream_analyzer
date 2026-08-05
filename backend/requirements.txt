@@ -13,6 +13,16 @@ pycocotools>=2.0.8
 einops>=0.8.0
 git+https://github.com/facebookresearch/sam3.git
 
+# YOLOE-26 (Ultralytics) — second, exemplar/visual-prompt recall source for
+# concepts with authored exemplars, alongside SAM 3's text-prompt recall.
+# See app/config.py's exemplar_recall_backend and
+# model_servers/perception/interface.py's detect_by_exemplar. Unpinned on
+# purpose: YOLO26/YOLOE-26 support landed recently and the exact minimum
+# `ultralytics` version wasn't confirmed against a real install as of
+# writing — pin this down once verified (see interface.py's module
+# docstring for the verification command).
+ultralytics
+
 # Backend-specific
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

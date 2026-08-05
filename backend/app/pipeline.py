@@ -32,6 +32,7 @@ rendezvous that cannot build a backlog. See that module for why not a queue.
     {"type": "tracks",    "data": [TrackedObject, ...]}
     {"type": "telemetry", "data": Telemetry}
     {"type": "event",     "data": EventItem}
+    {"type": "status",    "data": {"connected": bool, "url": str, "error": str | None}}
 
 `frame` is published at `display_fps`, independently of detection, so video
 stays smooth while SAM 3 manages only a few frames a second. Consumed by
@@ -57,7 +58,7 @@ from app.config import Settings
 from app.frame_slot import DemandSlot, FrameItem
 from app.schemas import EventItem, Telemetry, TrackedObject
 from app.store import ConceptStore
-from app.tracker import Tracker
+from app.tracker import Tracker, _iou
 from perception import Concept, Perception
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,74 @@ OnMessage = Callable[[dict[str, Any]], None]
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     denom = float(np.linalg.norm(a) * np.linalg.norm(b))
     return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+# Public (no leading underscore) — shared with main.py's exemplar-upload
+# endpoint, which needs the exact same crop/resize/encode pattern for
+# exemplar thumbnails, just at a smaller max_side. Kept in this module since
+# it's conceptually "how we turn a frame+box into something a VLM/model can
+# be shown," which pipeline.py already owns for detection crops.
+CONTEXT_CROP_MAX_SIDE = 640
+
+# Downscale cap for the whole-frame scene analysis image (_queue_scene_analysis)
+# — a full-res 720p/1080p frame costs more tokens/bandwidth for no benefit to
+# a general "what's happening" description. Wider than CONTEXT_CROP_MAX_SIDE
+# since it's the whole scene, not one object's crop — matches display_max_width's
+# default, a resolution already judged "plenty for a human to read at a glance."
+SCENE_IMAGE_MAX_WIDTH = 960
+
+
+def context_crop(frame: np.ndarray, box: tuple[int, int, int, int], margin: float,
+                 max_side: int = CONTEXT_CROP_MAX_SIDE) -> tuple[np.ndarray, list[int]]:
+    """Slice a crop around `box` expanded by `margin` on each side (e.g.
+    margin=0.6 -> the crop is ~2.2x the box's width/height), clamped to
+    frame bounds, longer side capped at `max_side`. Returns the crop as an
+    ndarray plus `box` re-expressed in the crop's own pixel coordinates, so
+    nothing downstream needs offset math against the source frame.
+
+    Deliberately wider than a tight box crop: a description/answer/exemplar
+    grounded in the object *and its surroundings* (what it's near, what it's
+    next to) is what these are for — a tight crop of the object alone
+    starves the VLM of exactly that.
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    bw, bh = x2 - x1, y2 - y1
+    pad_x, pad_y = bw * margin, bh * margin
+    cx1 = max(0, int(x1 - pad_x))
+    cy1 = max(0, int(y1 - pad_y))
+    cx2 = min(w, int(x2 + pad_x))
+    cy2 = min(h, int(y2 + pad_y))
+    crop = np.ascontiguousarray(frame[cy1:cy2, cx1:cx2])
+
+    # box, translated into the (still full-res) crop's own coordinates,
+    # clamped since padding can be asymmetric near frame edges.
+    box_in_crop = [
+        max(0, x1 - cx1), max(0, y1 - cy1),
+        min(cx2 - cx1, x2 - cx1), min(cy2 - cy1, y2 - cy1),
+    ]
+
+    crop_h, crop_w = crop.shape[:2]
+    long_side = max(crop_w, crop_h)
+    if long_side > max_side:
+        # Trades object detail for context: a bigger margin packs more
+        # surrounding scene into the same pixel budget, so the object itself
+        # renders smaller. max_side is the knob if that tradeoff needs to
+        # move the other way.
+        scale = max_side / long_side
+        crop = cv2.resize(crop, (max(1, int(crop_w * scale)), max(1, int(crop_h * scale))),
+                          interpolation=cv2.INTER_AREA)
+        box_in_crop = [int(v * scale) for v in box_in_crop]
+
+    return crop, box_in_crop
+
+
+def encode_rgb_jpeg_data_url(rgb: np.ndarray, quality: int = 85) -> str:
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise ValueError("failed to encode crop as JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
 
 
 class _Stats:
@@ -136,6 +205,14 @@ class Pipeline:
 
         self.display_slot = DemandSlot()
         self.detect_slot = DemandSlot()
+        # One-shot, full-resolution frame capture for context authoring (draw
+        # a box on a paused frame). Deliberately separate from display_slot:
+        # that one is downscaled to display_max_width for bandwidth, but
+        # exemplars are embedded against full ingest-resolution frames
+        # (_process_frame uses item.rgb, never downscaled) — boxing the
+        # smaller display frame would create exemplars from a measurably
+        # blurrier source than what live detections are compared against.
+        self.hires_slot = DemandSlot()
         self.stats = _Stats()
 
         # Out-of-band GPU work (currently: exemplar embedding from the REST
@@ -145,13 +222,28 @@ class Pipeline:
         self._vlm_pool: ThreadPoolExecutor | None = None
         self._vlm_pending = 0
         self._vlm_lock = threading.Lock()
+        # Set by start() — see the comment there for why this needs to be an
+        # instance attribute rather than staying a thread-local parameter.
+        self._on_message: OnMessage | None = None
+        # Set by request_reconnect(); polled by _ingest_once's frame loop and
+        # _wait_backoff so a source swap takes effect promptly instead of
+        # waiting out the current read or backoff.
+        self._reconnect = threading.Event()
+
+        # Tier-2 scene analysis: last time a whole-frame VLM call fired,
+        # same clock as FrameItem.captured — interval-gated in
+        # _process_frame, see _queue_scene_analysis.
+        self._last_scene_analysis: float = 0.0
 
     def load(self) -> None:
-        logger.info("loading SAM 3 + DINOv3 (backend=%s)...", self.settings.perception_backend)
+        logger.info("loading SAM 3 + DINOv3 (backend=%s, exemplar_recall=%s)...",
+                    self.settings.perception_backend, self.settings.exemplar_recall_backend)
         self.perception = Perception(
             backend=self.settings.perception_backend,
             sam_weights=self.settings.sam_weights,
             dinov3_weights=self.settings.dinov3_weights,
+            exemplar_recall_backend=self.settings.exemplar_recall_backend,
+            yoloe_weights=self.settings.yoloe_weights,
         )
         logger.info("perception ready")
 
@@ -171,6 +263,15 @@ class Pipeline:
         fut: Future = Future()
         self._gpu_inbox.put_nowait((fn, fut))
         return fut
+
+    def submit_vlm(self, fn: Callable[[], Any]) -> Future:
+        """Queue non-CUDA work (currently: Tier-3 chat) onto the VLM thread
+        pool. Shares admission control (vlm_max_concurrency) with Tier-2
+        descriptions rather than stacking uncontrolled load on top of a vLLM
+        instance already measured as this system's GPU-contention bottleneck.
+        """
+        assert self._vlm_pool is not None, "call start() before submit_vlm()"
+        return self._vlm_pool.submit(fn)
 
     def _drain_gpu_inbox(self) -> None:
         while True:
@@ -204,13 +305,40 @@ class Pipeline:
             try:
                 self._ingest_once(on_message, stop)
                 backoff = 1.0
-            except Exception:
+            except Exception as exc:
                 logger.exception("ingest loop failed, retrying in %.0fs", backoff)
-                # stop.wait() rather than sleep() so shutdown doesn't have to
-                # wait out the full backoff.
-                stop.wait(backoff)
+                on_message({"type": "status", "data": {
+                    "connected": False, "url": self.settings.stream_url, "error": str(exc),
+                }})
+                self._wait_backoff(backoff, stop)
                 backoff = min(backoff * 2, 15.0)
         logger.info("ingest thread exiting")
+
+    def _wait_backoff(self, seconds: float, stop: threading.Event) -> None:
+        """Interruptible reconnect backoff — wakes early on shutdown *or* a
+        reconnect request, so switching away from an already-dead source
+        doesn't have to wait out the old exponential backoff (up to 15s).
+        Polls in short slices since threading.Event can't wait on two events
+        at once; 0.2s is well under the granularity anyone would notice.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if stop.wait(0.2) or self._reconnect.is_set():
+                return
+
+    def request_reconnect(self, url: str) -> None:
+        """Swap the live source without restarting the process — called from
+        the REST handler on the event loop, which has no thread of its own
+        to receive on_message as a parameter, hence self._on_message (set in
+        start()). tracker.reset() already runs unconditionally at the top of
+        every _ingest_once entry, so stale tracks from the old source are
+        cleared for free once the swap takes effect.
+        """
+        self.settings.stream_url = url
+        self._reconnect.set()
+        if self._on_message is not None:
+            self._on_message({"type": "status",
+                              "data": {"connected": False, "url": url, "error": None}})
 
     def _ingest_once(self, on_message: OnMessage, stop: threading.Event) -> None:
         # A fresh stream is a fresh scene: stale tracks would IOU-match
@@ -221,12 +349,26 @@ class Pipeline:
         display_interval = 1.0 / max(self.settings.display_fps, 0.1)
         last_display = 0.0
         seq = 0
+        announced = False
 
         gen = ingest.frames(self.settings.stream_url)
         try:
             for video_frame, telemetry in gen:
                 if stop.is_set():
                     return
+                if self._reconnect.is_set():
+                    self._reconnect.clear()
+                    return
+
+                if not announced:
+                    # Only reachable once the generator has actually yielded
+                    # something, i.e. av.open() succeeded — a failed open
+                    # raises out of the `for` statement's implicit next()
+                    # before this point, straight into run_ingest's except.
+                    announced = True
+                    on_message({"type": "status", "data": {
+                        "connected": True, "url": self.settings.stream_url, "error": None,
+                    }})
 
                 if telemetry is not None:
                     self.last_telemetry = Telemetry(**telemetry)
@@ -242,7 +384,8 @@ class Pipeline:
                 # are wanted by nobody.
                 want_display = (now - last_display >= display_interval) and self.display_slot.wanted()
                 want_detect = self.detect_slot.wanted()
-                if not (want_display or want_detect):
+                want_hires = self.hires_slot.wanted()
+                if not (want_display or want_detect or want_hires):
                     continue
 
                 rgb = video_frame.to_ndarray(format="rgb24")
@@ -259,6 +402,8 @@ class Pipeline:
                     last_display = now
                 if want_detect:
                     self.detect_slot.offer(item)
+                if want_hires:
+                    self.hires_slot.offer(item)
 
                 self.stats.maybe_log(self.settings.perf_log_interval_s)
         finally:
@@ -353,13 +498,33 @@ class Pipeline:
             on_message({"type": "tracks", "data": []})
             return
 
-        concepts = [Concept(label=c.label, text_prompt=c.text_prompt) for c in enabled]
-        detections = self.perception.detect_track(frame, concepts, want_masks=False)
+        # Recall routing (see config.exemplar_recall_backend's docstring):
+        # concepts with no exemplars have nothing for YOLOE to bake a visual
+        # prompt from, so they always go through SAM 3's text prompt
+        # regardless of the setting. Concepts *with* exemplars are routed by
+        # the setting — "sam3" keeps this identical to pre-Phase-3 behavior.
+        backend = self.settings.exemplar_recall_backend
+        sam3_concepts = [c for c in enabled if not c.exemplars or backend in ("sam3", "both")]
+        yoloe_concepts = [c for c in enabled if c.exemplars and backend in ("yoloe26", "both")]
+
+        detections: list = []
+        if sam3_concepts:
+            concepts = [Concept(label=c.label, text_prompt=c.text_prompt) for c in sam3_concepts]
+            detections.extend(self.perception.detect_track(frame, concepts, want_masks=False))
+        for c in yoloe_concepts:
+            detections.extend(self.perception.detect_by_exemplar(frame, c.label, c.exemplars))
+
+        if yoloe_concepts:
+            # Only when both sources could have run for some concept —
+            # otherwise this is a no-op pass that risks changing SAM3-only
+            # behavior in a way "sam3" is supposed to never do (e.g. SAM 3
+            # occasionally proposing two overlapping boxes on its own).
+            detections = self._dedupe_by_iou(detections)
 
         # DINOv3 only earns its keep once a concept actually has exemplars to
         # compare against — otherwise _filter_by_exemplars passes everything
         # through and the embeddings are computed for nothing.
-        if detections and any(c.reference_embeddings for c in enabled):
+        if detections and any(c.exemplars for c in enabled):
             detections = self.perception.embed(frame, detections)
             detections = self._filter_by_exemplars(detections, enabled)
 
@@ -367,13 +532,28 @@ class Pipeline:
         tracks = self.tracker.update(raw, item.width, item.height, dt)
         self._broadcast_tracks(tracks, item.width, item.height, enabled, on_message)
 
-        by_label = {c.label: c for c in enabled}
-        for track in tracks:
-            if not track.is_new:
+        # Tier-2 is now a periodic whole-frame narrative, not one call per
+        # newly-appeared object — see config.scene_interval_s's docstring.
+        # Individual objects stay fully queryable on demand (see main.py's
+        # GET /api/tracks/{id}/snapshot); they just don't each trigger an
+        # automatic VLM call anymore, so cost is a flat rate regardless of
+        # how many objects are on screen.
+        if enabled and item.captured - self._last_scene_analysis >= self.settings.scene_interval_s:
+            self._last_scene_analysis = item.captured
+            self._queue_scene_analysis(item, on_message)
+
+    @staticmethod
+    def _dedupe_by_iou(detections: list, threshold: float = 0.6) -> list:
+        """Collapse near-duplicate boxes for the same concept — e.g. the
+        same physical object found by both SAM 3's text-prompt pass and
+        YOLOE-26's exemplar pass — keeping the higher-scoring one of each
+        overlapping pair. O(n^2) but n is a handful of detections per frame."""
+        kept: list = []
+        for det in sorted(detections, key=lambda d: d.score, reverse=True):
+            if any(det.concept == k.concept and _iou(det.box, k.box) >= threshold for k in kept):
                 continue
-            concept_record = by_label.get(track.concept)
-            if concept_record is not None:
-                self._queue_first_appearance(frame, track, concept_record.color, on_message)
+            kept.append(det)
+        return kept
 
     def _filter_by_exemplars(self, detections: list, enabled: list) -> list:
         """DINOv3 similarity gate — see config.match_threshold's docstring.
@@ -383,7 +563,7 @@ class Pipeline:
         kept = []
         for det in detections:
             record = by_label.get(det.concept)
-            refs = record.reference_embeddings if record else None
+            refs = [e.embedding for e in record.exemplars] if record else []
             if not refs:
                 kept.append(det)
                 continue
@@ -417,63 +597,75 @@ class Pipeline:
 
     # ---- Tier 2: VLM description, off the detection thread --------------------
 
-    def _queue_first_appearance(self, frame: np.ndarray, track, color: str,
-                                on_message: OnMessage) -> None:
+    # Neutral color for scene notes — not tied to a concept, so no concept
+    # color applies. Same fallback gray _broadcast_tracks already uses for
+    # an unmatched concept.
+    _SCENE_COLOR = "#94a3b8"
+
+    def _queue_scene_analysis(self, item: FrameItem, on_message: OnMessage) -> None:
+        """One whole-frame VLM call, gated to run at most once every
+        settings.scene_interval_s (see _process_frame) — replaces the old
+        per-object first-appearance analysis. Cost is now a flat rate
+        regardless of how many objects are on screen; individual objects
+        stay queryable via main.py's GET /api/tracks/{id}/snapshot instead
+        of each triggering an automatic call.
+        """
         if self._vlm_pool is None:
             return
 
+        frame = item.rgb
+        if frame.shape[1] > SCENE_IMAGE_MAX_WIDTH:
+            scale = SCENE_IMAGE_MAX_WIDTH / frame.shape[1]
+            frame = cv2.resize(frame, (SCENE_IMAGE_MAX_WIDTH, int(frame.shape[0] * scale)),
+                               interpolation=cv2.INTER_AREA)
+
+        try:
+            image = encode_rgb_jpeg_data_url(frame)
+        except Exception:
+            logger.exception("failed to encode scene image")
+            image = None
+
+        telemetry = self.last_telemetry
+
         with self._vlm_lock:
             if self._vlm_pending >= self.settings.vlm_max_pending:
-                # Better a plain label now than a growing pile of 30s requests
-                # against one vLLM instance.
+                # Skip this tick rather than posting a hollow fallback note —
+                # unlike a missed object detection, there's no "detected but
+                # couldn't describe" case here worth logging as an event; the
+                # next interval tries again shortly on its own.
                 self.stats.vlm_skipped += 1
-                self._emit_event(track, color, f"{track.concept.capitalize()} detected.", on_message)
                 return
             self._vlm_pending += 1
 
-        x1, y1, x2, y2 = track.box
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = max(x1 + 1, x2), max(y1 + 1, y2)
-        # .copy() is required, not hygiene: a slice is a *view* that pins the
-        # whole ~2.7MB frame, and this crop can sit in the queue for up to
-        # vlm_timeout_s.
-        crop = np.ascontiguousarray(frame[y1:y2, x1:x2])
-
-        # Capture identity/time/telemetry NOW. Reading them when the call
-        # returns would stamp the event with the VLM's completion time, which
-        # could be tens of seconds late.
-        concept, track_id = track.concept, track.track_id
-        telemetry = self.last_telemetry
-
         def _describe() -> None:
             try:
-                description = vlm_client.describe_crop(
-                    self.settings.vlm_base_url, self.settings.vlm_model, crop,
-                    concept, self.settings.vlm_timeout_s,
+                description = vlm_client.describe_scene(
+                    self.settings.vlm_base_url, self.settings.vlm_model, frame,
+                    self.settings.vlm_timeout_s,
                 )
             except Exception:
-                logger.exception("VLM description failed")
-                description = f"{concept.capitalize()} detected."
+                logger.exception("VLM scene description failed")
+                description = "No notable activity."
             finally:
                 with self._vlm_lock:
                     self._vlm_pending -= 1
-            self._emit_event_raw(track_id, concept, color, description, telemetry, on_message)
+            self._emit_event_raw(None, "scene", self._SCENE_COLOR, description, telemetry,
+                                 on_message, image, [])
 
         self._vlm_pool.submit(_describe)
 
-    def _emit_event(self, track, color: str, description: str, on_message: OnMessage) -> None:
-        self._emit_event_raw(track.track_id, track.concept, color, description,
-                             self.last_telemetry, on_message)
-
-    def _emit_event_raw(self, track_id: int, concept: str, color: str, description: str,
-                        telemetry: Telemetry, on_message: OnMessage) -> None:
+    def _emit_event_raw(self, track_id: int | None, concept: str, color: str, description: str,
+                        telemetry: Telemetry, on_message: OnMessage,
+                        image: str | None = None, box: list[int] | None = None) -> None:
         event = EventItem(
-            id=f"ev_{track_id}_{int(time.time() * 1000)}",
+            id=f"ev_{track_id if track_id is not None else 'scene'}_{int(time.time() * 1000)}",
             ts=int(time.time() * 1000),
             concept=concept,
             concept_color=color,
             severity="info",
-            kind="first appearance",
+            kind="scene overview",
+            image=image,
+            box=box or [],
             description=description,
             verdict="pending",
             tier=2,
@@ -486,6 +678,11 @@ class Pipeline:
     # ---- lifecycle ------------------------------------------------------------
 
     def start(self, on_message: OnMessage, stop: threading.Event) -> list[threading.Thread]:
+        # Retained so out-of-band callers (REST handlers on the event loop,
+        # e.g. request_reconnect()) can publish too — everything else gets
+        # on_message as a parameter, but those callers have no thread of
+        # their own to thread it through.
+        self._on_message = on_message
         self._vlm_pool = ThreadPoolExecutor(
             max_workers=self.settings.vlm_max_concurrency, thread_name_prefix="vlm"
         )
@@ -505,5 +702,6 @@ class Pipeline:
         """Wake every blocked consumer so the threads can observe their stop event."""
         self.display_slot.close()
         self.detect_slot.close()
+        self.hires_slot.close()
         if self._vlm_pool is not None:
             self._vlm_pool.shutdown(wait=False, cancel_futures=True)

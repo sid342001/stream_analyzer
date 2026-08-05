@@ -1,4 +1,5 @@
-"""In-memory perception: SAM 3 (+ DINOv3) loaded once, called in-process.
+"""In-memory perception: SAM 3 (+ DINOv3, + optionally YOLOE-26) loaded once,
+called in-process.
 
 This is the real-time hot path. It is imported by the backend, NOT served over
 HTTP on the live path (see ../README.md §1.3). Two backends hide behind one
@@ -21,10 +22,40 @@ directly, not guessed from examples. If `sam3` is upgraded, re-verify with:
 prompting alongside text prompts in one grounding pass, but isn't used here —
 this project's exemplar matching goes through DINOv3 similarity instead (see
 ../README.md's "Context authoring" section for why).
+
+## YOLOE-26 (optional, exemplar/visual-prompt recall)
+
+SAM 3's text-prompt recall (above) is a hard bottleneck for visually unique
+targets that no text phrasing describes well: it's the *only* thing that
+proposes candidate boxes, and DINOv3 only ever filters what SAM 3 already
+found. YOLOE-26 (Ultralytics) adds a second recall path, driven by an
+exemplar *image* instead of text — see `detect_by_exemplar` below and
+`app/config.py`'s `exemplar_recall_backend`.
+
+Verified against ultralytics==8.4.115 (`docker compose run --rm --entrypoint
+python3 backend -c "import inspect; from ultralytics import YOLOE;
+print(inspect.getsource(YOLOE.predict))"`) — `YOLOE.predict(source, ...,
+visual_prompts=None, refer_image=None, predictor=...)`: when `refer_image`
+is given, it calls `self.predictor.get_vpe(refer_image)` (using the boxes
+already registered via `set_prompts`, in `refer_image`'s own absolute pixel
+coordinates — not normalized) to get a visual-prompt embedding, bakes it
+into the model via `self.model.set_classes(...)`, resets `self.predictor`,
+then still runs inference on `source` in that same call — so one call both
+bakes the prompt and returns results for the current frame, and later plain
+`.predict(frame)` calls (no `refer_image`) reuse the baked classes.
+
+`refer_image` is a single image, not a list — the "multiple images" branch
+in `predict()`'s source only applies when *source* (the target, not the
+reference) is a list, a separate case. There's no code path for fusing
+boxes from multiple *separate* reference images into one baked prompt, so
+`detect_by_exemplar` only bakes the most recently authored exemplar per
+concept — confirmed limitation, not an assumption.
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -58,16 +89,31 @@ def _encode_mask_rle(mask: np.ndarray) -> str:
     return rle["counts"].decode("ascii")
 
 
+def _decode_exemplar_image(data_url: str) -> Image.Image:
+    _, _, b64data = data_url.partition(",")
+    raw = base64.b64decode(b64data)
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
 class Perception:
-    """Loads SAM 3 + DINOv3 onto the GPU once; exposes in-process inference."""
+    """Loads SAM 3 + DINOv3 (+ optionally YOLOE-26) onto the GPU once;
+    exposes in-process inference."""
 
     def __init__(self, backend: str, sam_weights: str, dinov3_weights: str,
-                 device: str = "cuda") -> None:
+                 device: str = "cuda", exemplar_recall_backend: str = "sam3",
+                 yoloe_weights: str | None = None) -> None:
         self.backend = backend
         self.device = device
         self.sam_weights = sam_weights
         self.dinov3_weights = dinov3_weights
+        self.exemplar_recall_backend = exemplar_recall_backend
+        self.yoloe_weights = yoloe_weights
         self._next_track_id = 0
+        self._yoloe_model = None
+        # concept_label -> id() of the Exemplar object last baked into
+        # YOLOE for it, so a re-bake only happens when the exemplar set for
+        # that concept actually changed (see detect_by_exemplar).
+        self._yoloe_baked: dict[str, int] = {}
         self._load()
 
     @classmethod
@@ -76,6 +122,8 @@ class Perception:
             backend=os.environ.get("PERCEPTION_BACKEND", "sam3"),
             sam_weights=os.environ.get("SAM_WEIGHTS", "/models/sam3"),
             dinov3_weights=os.environ.get("DINOV3_WEIGHTS", "/models/dinov3-vitl16"),
+            exemplar_recall_backend=os.environ.get("EXEMPLAR_RECALL_BACKEND", "both"),
+            yoloe_weights=os.environ.get("YOLOE_WEIGHTS", "/models/yoloe-26/yoloe-26s-seg.pt"),
         )
 
     def _load(self) -> None:
@@ -106,6 +154,15 @@ class Perception:
         self._dino_model = AutoModel.from_pretrained(
             self.dinov3_weights, device_map=self.device, attn_implementation="sdpa"
         ).eval()
+
+        # Only load YOLOE-26 when the setting could actually call it — no
+        # reason to spend GPU memory on a model that's guaranteed unused.
+        if self.exemplar_recall_backend in ("yoloe26", "both"):
+            from ultralytics import YOLOE
+
+            self._yoloe_model = YOLOE(self.yoloe_weights)
+            if self.device == "cuda":
+                self._yoloe_model.to(self.device)
 
     def detect_track(self, frame: np.ndarray, concepts: list[Concept],
                      want_masks: bool = True) -> list[Detection]:
@@ -186,6 +243,65 @@ class Perception:
                     mask_rle=mask_rle,
                     score=float(score),
                 ))
+        return detections
+
+    def detect_by_exemplar(self, frame: np.ndarray, concept_label: str,
+                           exemplars: list) -> list[Detection]:
+        """Tier-1 recall via YOLOE-26 visual prompting — complementary to
+        detect_track's SAM 3 text-prompt recall, see app/config.py's
+        exemplar_recall_backend. `exemplars` is ConceptRecord.exemplars (see
+        app/store.py): objects with `.image` (base64 JPEG data URL) and
+        `.box`.
+
+        Only the most recently authored exemplar is baked in per concept —
+        see this module's docstring for why multi-exemplar fusion isn't
+        attempted (the documented API demonstrates one reference image at a
+        time, not fusing several).
+        """
+        if self._yoloe_model is None or not exemplars:
+            return []
+
+        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+
+        pil_frame = Image.fromarray(frame)
+        exemplar = exemplars[-1]
+        # id(), not equality — Exemplar is frozen/immutable, so a changed
+        # exemplar set always produces a new object even if a value happens
+        # to repeat; cheap and sufficient as a "did this change" check.
+        cache_key = id(exemplar)
+
+        if self._yoloe_baked.get(concept_label) != cache_key:
+            ref_image = _decode_exemplar_image(exemplar.image)
+            visual_prompts = {
+                "bboxes": np.array([exemplar.box], dtype=np.float32),
+                "cls": np.array([0]),
+            }
+            results = self._yoloe_model.predict(
+                pil_frame, refer_image=ref_image, visual_prompts=visual_prompts,
+                predictor=YOLOEVPSegPredictor, verbose=False,
+            )
+            self._yoloe_baked[concept_label] = cache_key
+        else:
+            results = self._yoloe_model.predict(pil_frame, verbose=False)
+
+        return self._yoloe_results_to_detections(results, concept_label)
+
+    def _yoloe_results_to_detections(self, results, concept_label: str) -> list[Detection]:
+        if not results:
+            return []
+        boxes = results[0].boxes
+        if boxes is None or boxes.xyxy is None:
+            return []
+        detections: list[Detection] = []
+        for box_xyxy, score in zip(boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist()):
+            self._next_track_id += 1
+            detections.append(Detection(
+                track_id=self._next_track_id,
+                concept=concept_label,
+                box=tuple(int(v) for v in box_xyxy),
+                mask_rle="",
+                score=float(score),
+            ))
         return detections
 
     def embed(self, frame: np.ndarray, detections: list[Detection]) -> list[Detection]:

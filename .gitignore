@@ -57,6 +57,7 @@ data/
 *.pt
 *.onnx
 *.pmtiles
+*.zip
 
 # UAV clips, captures, generated streams/telemetry
 streams/*.ts

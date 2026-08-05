@@ -22,3 +22,7 @@ einops>=0.8.0             # sam3 imports this but doesn't declare it as a depend
 # access accepted, done on the HOST during the download step in
 # scripts/download_models.sh, before weights are mounted read-only here.
 git+https://github.com/facebookresearch/sam3.git
+
+# YOLOE-26 (Ultralytics) — kept identical to backend/requirements.txt, see
+# that file's comment.
+ultralytics

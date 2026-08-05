@@ -62,8 +62,20 @@ class EventItem(Camel):
     verdict: Verdict
     tier: Tier
     deep_analyzed: bool = Field(alias="deepAnalyzed")
-    track_id: int = Field(alias="trackId")
+    # None for scene-overview events (see pipeline.py's _queue_scene_analysis)
+    # — a periodic whole-frame narrative isn't about any one tracked object.
+    # Only set for events sourced from a specific track.
+    track_id: int | None = Field(alias="trackId")
     telemetry: Telemetry
+    # `image` is a base64 JPEG data URL — the analyzed frame for a scene
+    # note, or a margin crop for a track-scoped event (NOT the full frame —
+    # bounds memory); `box` is already in that image's OWN pixel
+    # coordinates, not the source frame's, so nothing downstream needs
+    # offset math. Empty/None when there's no object box (scene notes) or
+    # the crop failed — callers must handle the missing case rather than
+    # assume it's always present.
+    image: str | None = None
+    box: list[int] = Field(default_factory=list)
 
 
 class Concept(Camel):

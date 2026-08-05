@@ -31,6 +31,11 @@ services:
       VLM_MODEL_NAME: uav-vlm
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      # sam3 | yoloe26 | both — see app/config.py's exemplar_recall_backend
+      # docstring. Also the YOLOE-26 rollback switch: set to sam3 to skip
+      # loading it entirely.
+      EXEMPLAR_RECALL_BACKEND: ${EXEMPLAR_RECALL_BACKEND:-both}
+      YOLOE_WEIGHTS: ${YOLOE_WEIGHTS:-/models/yoloe-26/yoloe-26s-seg.pt}
     volumes:
       - ./model_servers/models:/models:ro
     deploy:
