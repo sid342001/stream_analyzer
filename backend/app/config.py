@@ -76,19 +76,26 @@ class Settings:
     # stay queryable on demand via GET /api/tracks/{id}/snapshot.
     scene_interval_s: float = float(os.environ.get("SCENE_INTERVAL_S", "8.0"))
 
-    # ---- YOLOE-26: exemplar/visual-prompt recall, alongside SAM 3's text-
-    # prompt recall — see model_servers/perception/interface.py's
-    # detect_by_exemplar and pipeline.py's _process_frame. Only applies to
-    # concepts that have authored exemplars; concepts without any always use
-    # SAM 3 text-prompt recall regardless of this setting.
-    #   "sam3"    -> text-prompt recall only (pre-this-phase behavior;
-    #                YOLOE-26 is never loaded or called)
-    #   "yoloe26" -> exemplar/visual-prompt recall only (skips SAM 3's text
-    #                pass for exemplar-bearing concepts)
-    #   "both"    -> union of both sources (default)
-    # Also the rollback switch: if YOLOE-26 integration doesn't verify
-    # cleanly, set this to "sam3" and behavior matches exactly what existed
-    # before this setting was added — no code change needed.
+    # ---- Perception backend routing — see model_servers/perception/
+    # interface.py's detect_track/detect_by_text/detect_by_exemplar and
+    # pipeline.py's _process_frame.
+    #   "sam3"    -> SAM 3 text-prompt recall only, for every concept
+    #                (pre-Phase-3 behavior; YOLOE-26 is never loaded or
+    #                called). Rollback switch: if YOLOE-26 integration
+    #                doesn't verify cleanly, set this and behavior matches
+    #                exactly what existed before YOLOE-26 was added.
+    #   "yoloe26" -> YOLOE-26 only; SAM 3 is not loaded at all (saves GPU
+    #                memory). YOLOE-26 is open-vocabulary, so it covers
+    #                both cases itself: plain text-prompt concepts go
+    #                through its text path (detect_by_text, same
+    #                set_classes()/get_text_pe() mechanism Ultralytics uses
+    #                for YOLOE's own open-vocab text mode — confirmed via
+    #                inspect.getsource, see interface.py's module
+    #                docstring), concepts with exemplars go through its
+    #                visual-prompt path (detect_by_exemplar) as before.
+    #   "both"    -> default. SAM 3 text-prompt recall for every concept,
+    #                plus YOLOE-26 visual-prompt recall as a second source
+    #                for concepts that have exemplars (deduped by IOU).
     exemplar_recall_backend: str = os.environ.get("EXEMPLAR_RECALL_BACKEND", "both")
     yoloe_weights: str = os.environ.get("YOLOE_WEIGHTS", "/models/yoloe-26/yoloe-26s-seg.pt")
 

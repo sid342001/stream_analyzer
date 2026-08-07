@@ -107,6 +107,23 @@ curl -fL "https://github.com/ultralytics/assets/releases/download/${ASSETS_RELEA
 && echo ">> saved models/yoloe-26/${YOLOE_VARIANT}" \
 || echo "!! YOLOE-26 download failed — check YOLOE_VARIANT/ASSETS_RELEASE against https://github.com/ultralytics/assets/releases"
 
+# mobileclip2_b.ts — the CLIP text-tower weight YOLOE-26's text-prompt path
+# (EXEMPLAR_RECALL_BACKEND=yoloe26 or "both", detect_by_text/set_classes)
+# needs at inference time. Not documented anywhere; found by actually
+# running the text-prompt path once and observing what ultralytics fetched
+# on its own (ultralytics.nn.text_model.build_text_model("mobileclip2:b") ->
+# MobileCLIPTS -> attempt_download_asset("mobileclip2_b.ts")). Pre-fetching
+# it here, next to the YOLOE-26 weights, plus pointing Ultralytics'
+# `weights_dir` setting at that same folder (see
+# model_servers/perception/interface.py's _load) means
+# attempt_download_asset finds it locally and never touches the network —
+# same "nothing is fetched at runtime" invariant as everything else here.
+: "${MOBILECLIP2_FILE:=mobileclip2_b.ts}"
+curl -fL "https://github.com/ultralytics/assets/releases/download/${ASSETS_RELEASE}/${MOBILECLIP2_FILE}" \
+    -o "models/yoloe-26/${MOBILECLIP2_FILE}" \
+&& echo ">> saved models/yoloe-26/${MOBILECLIP2_FILE}" \
+|| echo "!! mobileclip2 download failed — only needed for EXEMPLAR_RECALL_BACKEND=yoloe26/both's text-prompt path; check ASSETS_RELEASE"
+
 ###############################################################################
 
 echo

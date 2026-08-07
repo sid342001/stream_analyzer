@@ -26,3 +26,7 @@ git+https://github.com/facebookresearch/sam3.git
 # YOLOE-26 (Ultralytics) — kept identical to backend/requirements.txt, see
 # that file's comment.
 ultralytics
+
+# CLIP text encoder for YOLOE-26's text-prompt path (detect_by_text) — kept
+# identical to backend/requirements.txt, see that file's comment.
+git+https://github.com/ultralytics/CLIP.git

@@ -236,8 +236,11 @@ class Pipeline:
         self._last_scene_analysis: float = 0.0
 
     def load(self) -> None:
-        logger.info("loading SAM 3 + DINOv3 (backend=%s, exemplar_recall=%s)...",
-                    self.settings.perception_backend, self.settings.exemplar_recall_backend)
+        logger.info(
+            "loading perception (backend=%s, exemplar_recall=%s)%s...",
+            self.settings.perception_backend, self.settings.exemplar_recall_backend,
+            " [SAM 3 skipped]" if self.settings.exemplar_recall_backend == "yoloe26" else "",
+        )
         self.perception = Perception(
             backend=self.settings.perception_backend,
             sam_weights=self.settings.sam_weights,
@@ -498,28 +501,46 @@ class Pipeline:
             on_message({"type": "tracks", "data": []})
             return
 
-        # Recall routing (see config.exemplar_recall_backend's docstring):
-        # concepts with no exemplars have nothing for YOLOE to bake a visual
-        # prompt from, so they always go through SAM 3's text prompt
-        # regardless of the setting. Concepts *with* exemplars are routed by
-        # the setting — "sam3" keeps this identical to pre-Phase-3 behavior.
+        # Recall routing (see config.exemplar_recall_backend's docstring).
         backend = self.settings.exemplar_recall_backend
-        sam3_concepts = [c for c in enabled if not c.exemplars or backend in ("sam3", "both")]
-        yoloe_concepts = [c for c in enabled if c.exemplars and backend in ("yoloe26", "both")]
-
         detections: list = []
-        if sam3_concepts:
-            concepts = [Concept(label=c.label, text_prompt=c.text_prompt) for c in sam3_concepts]
-            detections.extend(self.perception.detect_track(frame, concepts, want_masks=False))
-        for c in yoloe_concepts:
-            detections.extend(self.perception.detect_by_exemplar(frame, c.label, c.exemplars))
 
-        if yoloe_concepts:
-            # Only when both sources could have run for some concept —
-            # otherwise this is a no-op pass that risks changing SAM3-only
-            # behavior in a way "sam3" is supposed to never do (e.g. SAM 3
-            # occasionally proposing two overlapping boxes on its own).
-            detections = self._dedupe_by_iou(detections)
+        if backend == "yoloe26":
+            # SAM 3 isn't loaded at all in this mode (Perception._load) —
+            # YOLOE-26 is open-vocabulary, so it stands in for SAM 3
+            # completely: plain text-prompt concepts go through its text
+            # path, concepts with exemplars through its visual-prompt path.
+            # The two sets are disjoint by construction, so no dedupe pass
+            # is needed here (unlike "both", where the same concept can be
+            # proposed by both engines).
+            text_concepts = [c for c in enabled if not c.exemplars]
+            exemplar_concepts = [c for c in enabled if c.exemplars]
+            if text_concepts:
+                concepts = [Concept(label=c.label, text_prompt=c.text_prompt) for c in text_concepts]
+                detections.extend(self.perception.detect_by_text(frame, concepts))
+            for c in exemplar_concepts:
+                detections.extend(self.perception.detect_by_exemplar(frame, c.label, c.exemplars))
+        else:
+            # "sam3" or "both": concepts with no exemplars have nothing for
+            # YOLOE to bake a visual prompt from, so they always go through
+            # SAM 3's text prompt regardless of the setting. Concepts *with*
+            # exemplars are routed by the setting — "sam3" keeps this
+            # identical to pre-Phase-3 behavior.
+            sam3_concepts = [c for c in enabled if not c.exemplars or backend in ("sam3", "both")]
+            yoloe_concepts = [c for c in enabled if c.exemplars and backend in ("yoloe26", "both")]
+
+            if sam3_concepts:
+                concepts = [Concept(label=c.label, text_prompt=c.text_prompt) for c in sam3_concepts]
+                detections.extend(self.perception.detect_track(frame, concepts, want_masks=False))
+            for c in yoloe_concepts:
+                detections.extend(self.perception.detect_by_exemplar(frame, c.label, c.exemplars))
+
+            if yoloe_concepts:
+                # Only when both sources could have run for some concept —
+                # otherwise this is a no-op pass that risks changing SAM3-only
+                # behavior in a way "sam3" is supposed to never do (e.g. SAM 3
+                # occasionally proposing two overlapping boxes on its own).
+                detections = self._dedupe_by_iou(detections)
 
         # DINOv3 only earns its keep once a concept actually has exemplars to
         # compare against — otherwise _filter_by_exemplars passes everything

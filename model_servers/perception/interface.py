@@ -23,7 +23,7 @@ prompting alongside text prompts in one grounding pass, but isn't used here —
 this project's exemplar matching goes through DINOv3 similarity instead (see
 ../README.md's "Context authoring" section for why).
 
-## YOLOE-26 (optional, exemplar/visual-prompt recall)
+## YOLOE-26 (optional; can run alongside SAM 3, or replace it entirely)
 
 SAM 3's text-prompt recall (above) is a hard bottleneck for visually unique
 targets that no text phrasing describes well: it's the *only* thing that
@@ -31,6 +31,19 @@ proposes candidate boxes, and DINOv3 only ever filters what SAM 3 already
 found. YOLOE-26 (Ultralytics) adds a second recall path, driven by an
 exemplar *image* instead of text — see `detect_by_exemplar` below and
 `app/config.py`'s `exemplar_recall_backend`.
+
+YOLOE-26 is also open-vocabulary in its own right (same family as
+YOLO-World), so when `exemplar_recall_backend == "yoloe26"` it doesn't just
+cover exemplar concepts — it covers plain text-prompt concepts too, via
+`detect_by_text`, and SAM 3 is skipped entirely (never loaded, never called;
+see `_load`). Confirmed via `inspect.getsource(YOLOE.set_classes)`
+(`docker compose run --rm --entrypoint python3 backend -c "import inspect;
+from ultralytics import YOLOE; print(inspect.getsource(YOLOE.set_classes))
+print(inspect.getsource(YOLOE.get_text_pe))"`): `set_classes(classes,
+embeddings=None)` calls `get_text_pe(classes)` to generate text embeddings
+whenever none are passed in, then bakes them the same way
+`detect_by_exemplar`'s visual-prompt embedding gets baked — this *is*
+Ultralytics' own open-vocab text mode, not a repurposed API.
 
 Verified against ultralytics==8.4.115 (`docker compose run --rm --entrypoint
 python3 backend -c "import inspect; from ultralytics import YOLOE;
@@ -59,6 +72,7 @@ import io
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -114,6 +128,12 @@ class Perception:
         # YOLOE for it, so a re-bake only happens when the exemplar set for
         # that concept actually changed (see detect_by_exemplar).
         self._yoloe_baked: dict[str, int] = {}
+        # Text-prompt side (detect_by_text): set_classes() re-embeds every
+        # call (get_text_pe has no caching of its own), so this remembers
+        # the last-baked prompt tuple + the label order it corresponds to,
+        # to skip re-baking when the text-prompt concept set is unchanged.
+        self._yoloe_text_baked: tuple[str, ...] | None = None
+        self._yoloe_text_labels: list[str] = []
         self._load()
 
     @classmethod
@@ -127,26 +147,34 @@ class Perception:
         )
 
     def _load(self) -> None:
-        if self.backend == "sam3":
-            from sam3.model_builder import build_sam3_image_model
-            from sam3.model.sam3_image_processor import Sam3Processor
+        self._sam_model = None
+        self._sam_processor = None
+        # exemplar_recall_backend == "yoloe26" discards SAM 3 completely
+        # (see app/config.py's docstring) — YOLOE-26 is open-vocabulary, so
+        # it covers text-prompt concepts itself (detect_by_text) as well as
+        # exemplar concepts (detect_by_exemplar). No reason to spend GPU
+        # memory loading a model that's guaranteed unused in that mode.
+        if self.exemplar_recall_backend != "yoloe26":
+            if self.backend == "sam3":
+                from sam3.model_builder import build_sam3_image_model
+                from sam3.model.sam3_image_processor import Sam3Processor
 
-            # load_from_HF=True (the default) downloads sam3.pt over the network
-            # when checkpoint_path is None — point it at the weights already on
-            # disk instead, so this never touches the network at runtime.
-            checkpoint_path = os.path.join(self.sam_weights, "sam3.pt")
-            self._sam_model = build_sam3_image_model(
-                checkpoint_path=checkpoint_path, load_from_HF=False
-            )
-            self._sam_processor = Sam3Processor(self._sam_model)
-        elif self.backend == "sam2_gdino":
-            raise NotImplementedError(
-                "sam2_gdino fallback not wired up. Load SAM 2.1 "
-                "(facebookresearch/sam2) + GroundingDINO/YOLO-World here if "
-                "SAM 3 checkpoint access isn't available — see README.md."
-            )
-        else:
-            raise ValueError(f"unknown PERCEPTION_BACKEND: {self.backend}")
+                # load_from_HF=True (the default) downloads sam3.pt over the network
+                # when checkpoint_path is None — point it at the weights already on
+                # disk instead, so this never touches the network at runtime.
+                checkpoint_path = os.path.join(self.sam_weights, "sam3.pt")
+                self._sam_model = build_sam3_image_model(
+                    checkpoint_path=checkpoint_path, load_from_HF=False
+                )
+                self._sam_processor = Sam3Processor(self._sam_model)
+            elif self.backend == "sam2_gdino":
+                raise NotImplementedError(
+                    "sam2_gdino fallback not wired up. Load SAM 2.1 "
+                    "(facebookresearch/sam2) + GroundingDINO/YOLO-World here if "
+                    "SAM 3 checkpoint access isn't available — see README.md."
+                )
+            else:
+                raise ValueError(f"unknown PERCEPTION_BACKEND: {self.backend}")
 
         from transformers import AutoImageProcessor, AutoModel
 
@@ -159,6 +187,18 @@ class Perception:
         # reason to spend GPU memory on a model that's guaranteed unused.
         if self.exemplar_recall_backend in ("yoloe26", "both"):
             from ultralytics import YOLOE
+            from ultralytics.utils import SETTINGS as _ultra_settings
+
+            # detect_by_text's text-prompt path pulls in a CLIP text-tower
+            # weight (mobileclip2_b.ts) via Ultralytics' own
+            # attempt_download_asset(), which checks CWD, then this
+            # `weights_dir` setting, before falling back to a live GitHub
+            # download. Pointing it at the same folder as the YOLOE-26
+            # weights means the copy scripts/download_models.sh pre-fetches
+            # there is found locally — no runtime network fetch, keeping
+            # the "nothing is fetched at runtime" invariant (see
+            # model_servers/README.md §8) intact for text-prompt mode too.
+            _ultra_settings["weights_dir"] = str(Path(self.yoloe_weights).parent)
 
             self._yoloe_model = YOLOE(self.yoloe_weights)
             if self.device == "cuda":
@@ -184,7 +224,14 @@ class Perception:
         with one `inference_state` per stream, kept alive across calls — that's
         what actually maintains track IDs. `backend/app/tracker.py` currently
         papers over this with greedy IOU matching.
+
+        Returns [] if SAM 3 isn't loaded (exemplar_recall_backend ==
+        "yoloe26" — see _load) rather than raising, so a caller that
+        forgets to check the routing rules degrades to "no SAM 3
+        detections" instead of crashing the detection thread.
         """
+        if self._sam_processor is None:
+            return []
         # SAM 3's weights are bfloat16; its own predictor code always runs inference
         # inside torch.autocast(dtype=bfloat16) (see sam3_base_predictor.py) — without
         # it, set_image()'s float32 input mismatches the model's dtype.
@@ -285,6 +332,53 @@ class Perception:
             results = self._yoloe_model.predict(pil_frame, verbose=False)
 
         return self._yoloe_results_to_detections(results, concept_label)
+
+    def detect_by_text(self, frame: np.ndarray, concepts: list[Concept]) -> list[Detection]:
+        """Open-vocabulary text-prompt recall via YOLOE-26 — stands in for
+        SAM 3's detect_track when exemplar_recall_backend == "yoloe26" (SAM
+        3 isn't loaded at all in that mode; see _load and
+        app/config.py's exemplar_recall_backend). Same checkpoint as
+        detect_by_exemplar: YOLOE.set_classes() generates text embeddings
+        via get_text_pe() when none are supplied (confirmed by reading
+        YOLOE.set_classes's source — see this module's docstring), which is
+        exactly Ultralytics' own open-vocab text-prompt mechanism, not a
+        repurposing of the visual-prompt path.
+
+        One set_classes()+predict() call covers every concept at once
+        (class index -> label via `_yoloe_text_labels`), same "one batched
+        pass, not one per concept" shape as detect_track's set_image().
+        """
+        text_concepts = [c for c in concepts if c.text_prompt]
+        if self._yoloe_model is None or not text_concepts:
+            return []
+
+        labels = [c.label for c in text_concepts]
+        prompts = tuple(c.text_prompt for c in text_concepts)
+        if self._yoloe_text_baked != prompts:
+            self._yoloe_model.set_classes(list(prompts))
+            self._yoloe_text_baked = prompts
+            self._yoloe_text_labels = labels
+
+        pil_frame = Image.fromarray(frame)
+        results = self._yoloe_model.predict(pil_frame, verbose=False)
+        if not results:
+            return []
+        boxes = results[0].boxes
+        if boxes is None or boxes.xyxy is None:
+            return []
+        detections: list[Detection] = []
+        for box_xyxy, score, cls_idx in zip(
+            boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist(), boxes.cls.cpu().tolist()
+        ):
+            self._next_track_id += 1
+            detections.append(Detection(
+                track_id=self._next_track_id,
+                concept=self._yoloe_text_labels[int(cls_idx)],
+                box=tuple(int(v) for v in box_xyxy),
+                mask_rle="",
+                score=float(score),
+            ))
+        return detections
 
     def _yoloe_results_to_detections(self, results, concept_label: str) -> list[Detection]:
         if not results:

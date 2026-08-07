@@ -146,7 +146,7 @@ container still starts fine, but Tier-2 VLM calls will fail until it is.
 | `MATCH_THRESHOLD` | `0.55` | DINOv3 cosine-similarity gate for concepts with authored exemplars — see §5. |
 | `CONTEXT_CROP_MARGIN` | `0.6` | How far the Tier-2/Tier-3 evidence crop expands past the tracked box, as a fraction of the box's own size — `0.6` ≈ 2.2x. Both the "what is this doing" VLM call and the Tier-3 chat evidence image use this crop. |
 | `SCENE_INTERVAL_S` | `8.0` | How often (seconds) Tier-2 runs a whole-frame scene overview — see §5.1. One VLM call per interval tick, **not** one per detected object, so this is the flat, predictable Tier-2 cost knob regardless of how busy the scene is. Individual objects are queryable on demand instead (Objects tab → `GET /api/tracks/{id}/snapshot`), not automatically analyzed. |
-| `EXEMPLAR_RECALL_BACKEND` | `both` | `sam3` \| `yoloe26` \| `both` — which recall source(s) run for concepts *with* authored exemplars (concepts without any always use SAM 3 text-prompt recall regardless). See "`EXEMPLAR_RECALL_BACKEND` cost" below for the measured overhead, and `app/config.py`'s docstring — `sam3` is the rollback switch if YOLOE-26 doesn't work out. |
+| `EXEMPLAR_RECALL_BACKEND` | `both` | `sam3` \| `yoloe26` \| `both`. `sam3` = SAM 3 only (YOLOE-26 never loaded; rollback switch). `both` = SAM 3 for every concept, plus YOLOE-26 as a second recall source for concepts with authored exemplars (deduped). `yoloe26` = SAM 3 is **not loaded at all** — YOLOE-26 (open-vocabulary) covers everything itself: text-prompt concepts via its own text path, exemplar concepts via visual-prompt recall. See "`EXEMPLAR_RECALL_BACKEND` cost" below and `app/config.py`'s docstring. |
 | `YOLOE_WEIGHTS` | `/models/yoloe-26/yoloe-26s-seg.pt` | Path inside the container. Only loaded when `EXEMPLAR_RECALL_BACKEND` is `yoloe26` or `both`. |
 | `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | `1` | Never phone home; weights are already local. |
 
@@ -361,6 +361,13 @@ actually have authored exemplars (see `app/pipeline.py`'s `_process_frame`),
 so a watch-list where most concepts are still text-prompt-only sees little
 of this. `EXEMPLAR_RECALL_BACKEND=sam3` reverts to the pre-YOLOE cost
 exactly (see `app/config.py`'s docstring — it's the rollback switch).
+
+`EXEMPLAR_RECALL_BACKEND=yoloe26` is the opposite end: SAM 3 isn't loaded at
+all, so its ~413 ms baseline is gone entirely, replaced by YOLOE-26 running
+for *every* enabled concept (not just exemplar-bearing ones) — not yet
+measured end-to-end here, but expect it to track YOLOE-26's per-concept cost
+from the row above rather than SAM 3's, since it's now the only detector in
+the loop.
 
 ---
 
